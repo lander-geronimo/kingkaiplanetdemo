@@ -1,9 +1,28 @@
 // scene.js
 // Planet geometry + shaders for King Kai's planet branch.
 
+const { mat4 } = window.glMatrix;
+
 // Module-level state for the planet and its shader program
 let planet = null;
 let planetProgram = null;
+
+// Orbit camera state
+const camera = {
+  radius: 4.5,
+  minRadius: 2.5,
+  maxRadius: 8,
+  theta: 0,
+  phi: Math.PI / 3,
+  target: [0, 0, 0],
+  view: mat4.create(),
+  projection: mat4.create(),
+  isDragging: false,
+  lastMouseX: 0,
+  lastMouseY: 0,
+  rotationSpeed: 0.0035,
+  zoomSpeed: 0.15,
+};
 
 // Vertex / fragment shader sources for the planet
 const PLANET_VERTEX_SOURCE = `
@@ -69,26 +88,19 @@ export function initScene(gl) {
   // Deep space-like clear color, slight purple/blue tint
   gl.clearColor(0.02, 0.0, 0.08, 1.0);
 
+  setupOrbitControls(gl.canvas);
   initPlanet(gl);
 }
 
 export function updateScene(gl, dt) {
+  updateCameraMatrices(gl);
   // Physics / movement / gravity will go here later.
 }
 
 export function renderScene(gl) {
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-  // For now, use identity matrices as placeholder view/projection.
-  // The camera branch will replace these with real matrices.
-  const identity = new Float32Array([
-    1, 0, 0, 0,
-    0, 1, 0, 0,
-    0, 0, 1, 0,
-    0, 0, 0, 1,
-  ]);
-
-  drawPlanet(gl, identity, identity);
+  drawPlanet(gl, camera.view, camera.projection);
 }
 
 // Exported so the camera branch can call it directly if desired.
@@ -176,6 +188,73 @@ function initPlanet(gl) {
   };
 
   planetProgram = createPlanetProgram(gl);
+}
+
+function setupOrbitControls(canvas) {
+  canvas.addEventListener("mousedown", handleMouseDown);
+  window.addEventListener("mouseup", handleMouseUp);
+  window.addEventListener("mousemove", handleMouseMove);
+  canvas.addEventListener("wheel", handleWheel, { passive: false });
+}
+
+function handleMouseDown(event) {
+  camera.isDragging = true;
+  camera.lastMouseX = event.clientX;
+  camera.lastMouseY = event.clientY;
+}
+
+function handleMouseUp() {
+  camera.isDragging = false;
+}
+
+function handleMouseMove(event) {
+  if (!camera.isDragging) return;
+
+  const deltaX =
+    typeof event.movementX === "number"
+      ? event.movementX
+      : event.clientX - camera.lastMouseX;
+  const deltaY =
+    typeof event.movementY === "number"
+      ? event.movementY
+      : event.clientY - camera.lastMouseY;
+
+  camera.theta += deltaX * camera.rotationSpeed;
+  camera.phi -= deltaY * camera.rotationSpeed;
+
+  const minPhi = 0.1;
+  const maxPhi = Math.PI - 0.1;
+  camera.phi = Math.max(minPhi, Math.min(maxPhi, camera.phi));
+
+  camera.lastMouseX = event.clientX;
+  camera.lastMouseY = event.clientY;
+}
+
+function handleWheel(event) {
+  event.preventDefault();
+
+  const delta = event.deltaY * camera.zoomSpeed * 0.01;
+  camera.radius = Math.max(
+    camera.minRadius,
+    Math.min(camera.maxRadius, camera.radius + delta)
+  );
+}
+
+function updateCameraMatrices(gl) {
+  const canvas = gl.canvas;
+  const aspect = canvas.clientWidth / canvas.clientHeight || 1;
+
+  mat4.perspective(camera.projection, Math.PI / 3, aspect, 0.1, 100.0);
+
+  const sinPhi = Math.sin(camera.phi);
+  const eyeX = camera.radius * sinPhi * Math.cos(camera.theta);
+  const eyeY = camera.radius * Math.cos(camera.phi);
+  const eyeZ = camera.radius * sinPhi * Math.sin(camera.theta);
+
+  const eye = [eyeX, eyeY, eyeZ];
+  const up = [0, 1, 0];
+
+  mat4.lookAt(camera.view, eye, camera.target, up);
 }
 
 function createPlanetProgram(gl) {
