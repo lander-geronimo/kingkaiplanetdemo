@@ -1,30 +1,9 @@
 // scene.js
 // Planet geometry + shaders for King Kai's planet branch.
 
-const { mat4, vec3 } = glMatrix;
-
 // Module-level state for the planet and its shader program
 let planet = null;
 let planetProgram = null;
-
-// Camera state
-const camera = {
-  radius: 5.0,
-  theta: 0.0, // Horizontal angle
-  phi: Math.PI / 3, // Vertical angle (small positive value)
-  target: vec3.fromValues(0, 0, 0),
-  view: mat4.create(),
-  projection: mat4.create(),
-  // Input state
-  isDragging: false,
-  lastMouseX: 0,
-  lastMouseY: 0,
-  sensitivity: 0.01,
-  zoomSensitivity: 0.0015,
-};
-
-let canvas;
-let needsMatrixUpdate = true;
 
 // Vertex / fragment shader sources for the planet
 const PLANET_VERTEX_SOURCE = `
@@ -86,122 +65,33 @@ void main() {
 
 export function initScene(gl) {
   console.log("Scene initialized");
-  canvas = gl.canvas;
 
   // Deep space-like clear color, slight purple/blue tint
   gl.clearColor(0.02, 0.0, 0.08, 1.0);
 
-  // Initialize planet geometry and shaders
   initPlanet(gl);
-
-  // Setup orbit controls
-  setupOrbitControls();
-
-  // Handle window resize to update projection matrix
-  window.addEventListener("resize", () => {
-    needsMatrixUpdate = true;
-  });
-
-  // Initial camera matrices
-  updateCameraMatrices(gl);
-  needsMatrixUpdate = false;
-}
-
-function setupOrbitControls() {
-  if (!canvas) return;
-
-  // Mouse down - start dragging
-  canvas.addEventListener("mousedown", (e) => {
-    camera.isDragging = true;
-    camera.lastMouseX = e.clientX;
-    camera.lastMouseY = e.clientY;
-    canvas.style.cursor = "grabbing";
-  });
-
-  // Mouse move - update angles
-  canvas.addEventListener("mousemove", (e) => {
-    if (!camera.isDragging) return;
-
-    const deltaX = e.clientX - camera.lastMouseX;
-    const deltaY = e.clientY - camera.lastMouseY;
-
-    // Update theta (horizontal rotation)
-    camera.theta -= deltaX * camera.sensitivity;
-
-    // Update phi (vertical rotation) with clamping
-    camera.phi += deltaY * camera.sensitivity;
-    const minPhi = 0.1;
-    const maxPhi = Math.PI - 0.1;
-    camera.phi = Math.max(minPhi, Math.min(maxPhi, camera.phi));
-
-    camera.lastMouseX = e.clientX;
-    camera.lastMouseY = e.clientY;
-    needsMatrixUpdate = true;
-  });
-
-  const endDrag = () => {
-    camera.isDragging = false;
-    canvas.style.cursor = "default";
-  };
-
-  // Mouse up / leave - stop dragging
-  canvas.addEventListener("mouseup", endDrag);
-  canvas.addEventListener("mouseleave", endDrag);
-
-  // Scroll - zoom in/out
-  canvas.addEventListener(
-    "wheel",
-    (e) => {
-      e.preventDefault();
-      const delta = e.deltaY * camera.zoomSensitivity;
-      camera.radius += delta;
-      // Clamp radius to reasonable bounds
-      camera.radius = Math.max(1.0, Math.min(20.0, camera.radius));
-      needsMatrixUpdate = true;
-    },
-    { passive: false }
-  );
-}
-
-function updateCameraMatrices(gl) {
-  const aspect = gl.canvas.width / gl.canvas.height;
-  const fov = Math.PI / 4; // 45 degrees
-  const near = 0.1;
-  const far = 100.0;
-
-  // Update projection matrix
-  mat4.perspective(camera.projection, fov, aspect, near, far);
-
-  // Calculate camera position from spherical coordinates
-  const x = camera.radius * Math.sin(camera.phi) * Math.cos(camera.theta);
-  const y = camera.radius * Math.cos(camera.phi);
-  const z = camera.radius * Math.sin(camera.phi) * Math.sin(camera.theta);
-  const cameraPos = vec3.fromValues(x, y, z);
-
-  // Update view matrix
-  const up = vec3.fromValues(0, 1, 0);
-  mat4.lookAt(camera.view, cameraPos, camera.target, up);
 }
 
 export function updateScene(gl, dt) {
-  // Update camera matrices if needed (e.g., on resize or input)
-  if (needsMatrixUpdate) {
-    updateCameraMatrices(gl);
-    needsMatrixUpdate = false;
-  }
-  // TODO:
-  // - physics
-  // - movement
-  // - gravity toward planet center
+  // Physics / movement / gravity will go here later.
 }
 
 export function renderScene(gl) {
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-  drawPlanet(gl, camera.view, camera.projection);
+  // For now, use identity matrices as placeholder view/projection.
+  // The camera branch will replace these with real matrices.
+  const identity = new Float32Array([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    0, 0, 0, 1,
+  ]);
+
+  drawPlanet(gl, identity, identity);
 }
 
-// Exported so other modules can draw the planet if desired.
+// Exported so the camera branch can call it directly if desired.
 export function drawPlanet(gl, view, projection) {
   if (!planet || !planetProgram) return;
 
@@ -269,11 +159,7 @@ function initPlanet(gl) {
   // Index buffer
   const indexBuffer = gl.createBuffer();
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
-  gl.bufferData(
-    gl.ELEMENT_ARRAY_BUFFER,
-    new Uint16Array(indices),
-    gl.STATIC_DRAW
-  );
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
 
   planet = {
     positionBuffer,
