@@ -24,6 +24,34 @@ let roadStripes = [];
 let roadCap = null;
 let fountain = null;
 
+// Background (gradient + clouds) state
+let bgProgram = null;
+let bgQuadVbo = null;
+let bgQuadIbo = null;
+let bgTime = 0;
+// Clouds disabled, keep placeholders to avoid reference errors
+let cloudProgram = null;
+let cloudNoiseTex = null;
+
+// Orbiting sprite + trail
+let orbProgram = null;
+let orbTrailProgram = null;
+let orbTrailSpriteProgram = null;
+let orbBillboardVbo = null;
+let orbTrailVbo = null;
+let orbTrailIbo = null;
+let orbTrailVertexCount = 0;
+const orbState = {
+  angle: 0,
+  angularSpeed: 0.6, // radians/sec
+  radius: 1.6,
+  height: 0.2,
+  size: 0.07,
+  trailMax: 160,
+  trailPositions: [],
+  trailDirty: true,
+};
+
 // Orbit camera state
 const camera = {
   radius: 4.5,
@@ -99,6 +127,216 @@ void main() {
 }
 `;
 
+// Fullscreen quad vertex shader (shared by background passes)
+const BG_VERTEX_SOURCE = `
+attribute vec2 aPosition;
+attribute vec2 aUv;
+varying vec2 vUv;
+void main() {
+  vUv = aUv;
+  gl_Position = vec4(aPosition, 0.0, 1.0);
+}
+`;
+
+// Gradient background fragment: pink upper sky → yellow lower clouds
+const BG_FRAGMENT_SOURCE = `
+precision mediump float;
+varying vec2 vUv;
+uniform vec3 uTop;
+uniform vec3 uMid;
+uniform vec3 uBottom;
+uniform vec3 uRight;
+uniform vec3 uUp;
+uniform vec3 uForward;
+uniform float uAspect;
+void main() {
+  // Reconstruct a world-space view direction so background responds to camera orientation.
+  vec2 ndc = vUv * 2.0 - 1.0;
+  vec3 dir = normalize(uRight * (ndc.x * uAspect) + uUp * ndc.y + uForward);
+
+  float t = clamp(0.5 + 0.5 * dir.y, 0.0, 1.0);
+  float midT = smoothstep(0.35, 0.65, t);
+  vec3 upper = mix(uTop, uMid, midT);
+  float lowerMix = smoothstep(0.0, 0.4, 1.0 - t);
+  vec3 color = mix(upper, uBottom, lowerMix);
+  gl_FragColor = vec4(color, 1.0);
+}
+`;
+
+// Cloud overlay fragment: scrolling noise, masked to lower region, tied to camera orientation
+const CLOUD_FRAGMENT_SOURCE = `
+precision mediump float;
+varying vec2 vUv;
+uniform sampler2D uNoise;
+uniform vec2 uUvScale;
+uniform vec2 uScroll;
+uniform float uTime;
+uniform float uMaskHeight;
+uniform float uCloudOpacity;
+uniform vec3 uCloudColor;
+uniform vec3 uRight;
+uniform vec3 uUp;
+uniform vec3 uForward;
+uniform float uAspect;
+
+// Convert a direction to simple spherical UV for clouds
+vec2 dirToUV(vec3 d) {
+  float az = atan(d.z, d.x);          // [-pi, pi]
+  float el = asin(clamp(d.y, -1.0, 1.0)); // [-pi/2, pi/2]
+  return vec2(az / (2.0 * 3.14159265) + 0.5, el / 3.14159265 + 0.5);
+}
+
+void main() {
+  vec2 ndc = vUv * 2.0 - 1.0;
+  vec3 dir = normalize(uRight * (ndc.x * uAspect) + uUp * ndc.y + uForward);
+
+  // Mask clouds to the lower/southern dome (favor y < 0)
+  float hemiMask = smoothstep(uMaskHeight, uMaskHeight - 0.25, dir.y);
+
+  // Spherical UVs for cloud sampling
+  vec2 suv = dirToUV(dir);
+  vec2 uv = suv * uUvScale + uScroll * uTime;
+
+  // Simple two-octave fBm to make a fuller carpet
+  float n1 = texture2D(uNoise, uv).r;
+  float n2 = texture2D(uNoise, uv * 2.3 + 7.1).r;
+  float n = mix(n1, n2, 0.35);
+
+  // Soft threshold to get broad puffy areas
+  float cloud = smoothstep(0.35, 0.6, n);
+
+  float alpha = cloud * hemiMask * uCloudOpacity;
+  gl_FragColor = vec4(uCloudColor, alpha);
+}
+`;
+
+// 3D cloud billboard shaders
+const CLOUD3D_VERTEX_SOURCE = `
+attribute vec3 aCenter;
+attribute vec2 aOffset;
+attribute float aSize;
+
+uniform mat4 uView;
+uniform mat4 uProjection;
+uniform vec3 uRight;
+uniform vec3 uUp;
+
+varying vec2 vUv;
+
+void main() {
+  vec3 worldPos = aCenter + (uRight * aOffset.x + uUp * aOffset.y) * aSize;
+  vUv = aOffset * 0.5 + 0.5;
+  gl_Position = uProjection * uView * vec4(worldPos, 1.0);
+}
+`;
+
+const CLOUD3D_FRAGMENT_SOURCE = `
+precision mediump float;
+varying vec2 vUv;
+uniform sampler2D uNoise;
+uniform vec3 uColor;
+uniform float uSoftness;
+uniform float uAlpha;
+
+void main() {
+  // Soft round falloff
+  float d = length(vUv - 0.5) * 2.0;
+  float falloff = smoothstep(1.0, uSoftness, d);
+
+  float n = texture2D(uNoise, vUv * 1.8).r;
+  float cloud = smoothstep(0.35, 0.65, n);
+
+  float alpha = cloud * falloff * uAlpha;
+  gl_FragColor = vec4(uColor, alpha);
+}
+`;
+
+// Orbiting sprite billboard
+const ORB_VERTEX_SOURCE = `
+attribute vec2 aOffset;
+uniform mat4 uView;
+uniform mat4 uProjection;
+uniform vec3 uRight;
+uniform vec3 uUp;
+uniform float uSize;
+uniform vec3 uCenter;
+varying vec2 vUv;
+void main() {
+  vec3 worldPos = uCenter + (uRight * aOffset.x + uUp * aOffset.y) * uSize;
+  vUv = aOffset * 0.5 + 0.5;
+  gl_Position = uProjection * uView * vec4(worldPos, 1.0);
+}
+`;
+
+const ORB_FRAGMENT_SOURCE = `
+precision mediump float;
+varying vec2 vUv;
+uniform vec3 uColorOuter;
+uniform vec3 uColorInner;
+void main() {
+  float d = length(vUv - 0.5) * 2.0;
+  float falloff = smoothstep(1.0, 0.0, d);
+  float core = smoothstep(0.25, 0.0, d);
+  vec3 col = mix(uColorOuter, uColorInner, core);
+  gl_FragColor = vec4(col, falloff);
+}
+`;
+
+// Orbit trail (line strip)
+const ORB_TRAIL_VERTEX_SOURCE = `
+attribute vec3 aPosition;
+attribute float aAlpha;
+uniform mat4 uView;
+uniform mat4 uProjection;
+varying float vAlpha;
+void main() {
+  vAlpha = aAlpha;
+  gl_Position = uProjection * uView * vec4(aPosition, 1.0);
+}
+`;
+
+const ORB_TRAIL_FRAGMENT_SOURCE = `
+precision mediump float;
+varying float vAlpha;
+uniform vec3 uColor;
+void main() {
+  gl_FragColor = vec4(uColor, vAlpha);
+}
+`;
+
+// Orbit trail sprites (billboarded puffs)
+const ORB_TRAIL_SPRITE_VERTEX_SOURCE = `
+attribute vec3 aCenter;
+attribute vec2 aOffset;
+attribute float aSize;
+attribute float aAlpha;
+uniform mat4 uView;
+uniform mat4 uProjection;
+uniform vec3 uRight;
+uniform vec3 uUp;
+varying vec2 vUv;
+varying float vAlpha;
+void main() {
+  vec3 worldPos = aCenter + (uRight * aOffset.x + uUp * aOffset.y) * aSize;
+  vUv = aOffset * 0.5 + 0.5;
+  vAlpha = aAlpha;
+  gl_Position = uProjection * uView * vec4(worldPos, 1.0);
+}
+`;
+
+const ORB_TRAIL_SPRITE_FRAGMENT_SOURCE = `
+precision mediump float;
+varying vec2 vUv;
+varying float vAlpha;
+uniform vec3 uColor;
+void main() {
+  float d = length(vUv - 0.5) * 2.0;
+  float falloff = smoothstep(1.0, 0.0, d);
+  float alpha = falloff * vAlpha;
+  gl_FragColor = vec4(uColor, alpha);
+}
+`;
+
 export function initScene(gl) {
   console.log("Scene initialized");
 
@@ -111,6 +349,7 @@ export function initScene(gl) {
   // Deep space-like clear color, slight purple/blue tint
   gl.clearColor(0.02, 0.0, 0.08, 1.0);
 
+  initBackground(gl);
   setupOrbitControls(gl.canvas);
   initPlanet(gl);
   initHouse(gl);
@@ -118,19 +357,32 @@ export function initScene(gl) {
   initRoad(gl);
   initFountain(gl);
   initTrees(gl);
+  initOrbiter(gl);
 }
 
 export function updateScene(gl, dt) {
   resizeViewportIfNeeded(gl);
   updateCameraMatrices(gl);
   spinPlanet(dt);
+  bgTime += dt;
+  updateOrbiter(dt);
 }
 
 export function renderScene(gl) {
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-  gl.disable(gl.BLEND);
+
+  // Draw background: gradient only
+  gl.disable(gl.DEPTH_TEST);
+  gl.depthMask(false);
+  gl.disable(gl.CULL_FACE);
+
+  drawBackgroundGradient(gl);
+
+  // Restore depth for scene objects
+  gl.enable(gl.DEPTH_TEST);
   gl.depthMask(true);
   gl.depthFunc(gl.LEQUAL);
+  gl.enable(gl.CULL_FACE);
 
   drawPlanet(gl, camera.view, camera.projection);
   drawHouse(gl, camera.view, camera.projection);
@@ -138,6 +390,20 @@ export function renderScene(gl) {
   drawRoad(gl, camera.view, camera.projection);
   drawFountain(gl, camera.view, camera.projection);
   drawTrees(gl, camera.view, camera.projection);
+
+  // Orbiting sprite + trail (drawn last, depth-tested, no depth writes)
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthMask(false);
+  gl.depthFunc(gl.LEQUAL);
+  const cullWasEnabled = gl.isEnabled(gl.CULL_FACE);
+  if (cullWasEnabled) gl.disable(gl.CULL_FACE);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  drawOrbiterTrail(gl, camera.view, camera.projection);
+  drawOrbiter(gl, camera.view, camera.projection);
+  gl.disable(gl.BLEND);
+  if (cullWasEnabled) gl.enable(gl.CULL_FACE);
+  gl.depthMask(true);
 }
 
 // Exported so the camera branch can call it directly if desired.
@@ -645,30 +911,69 @@ function initTrees(gl) {
   const foliageGeom = createSphere(baseFoliageRadius, 10, 12);
   const foliageMesh = createMesh(gl, foliageGeom);
 
-  // Procedurally distribute trees around the planet, avoiding the house area
-  const treesToPlace = 18;
+  // Procedurally distribute trees around the planet, avoiding other objects
+  const treesToPlace = 20;
   const houseLat = Math.PI * 0.18;
   const houseLon = Math.PI * 0.3;
-  const minAngleFromHouse = 0.32; // radians
+  const garageLat = Math.PI * 0.22;
+  const garageLon = Math.PI * 0.30 + Math.PI * 0.18;
+  const fountainLat = Math.PI * 0.24;
+  const fountainLon = Math.PI * 0.30 - Math.PI * 0.18;
+  const roadLatHalf = 0.12; // matches initRoad
+  const roadClearance = 0.06; // keep trees off the belt
+  const minTreeSeparation = 0.16;
+  const latMin = roadLatHalf + roadClearance + 0.02; // just outside the road band
+  const poleMargin = 0.08; // avoid exact poles for stability
+  const latMax = Math.PI * 0.5 - poleMargin; // nearly up to the poles
+
+  const blockers = [
+    { lat: houseLat, lon: houseLon, minAngle: 0.32 },
+    { lat: garageLat, lon: garageLon, minAngle: 0.26 },
+    { lat: fountainLat, lon: fountainLon, minAngle: 0.24 },
+  ];
+
   const placements = [];
 
+  const isPlacementClear = (lat, lon) => {
+    if (Math.abs(lat) < roadLatHalf + roadClearance) return false;
+    for (const blocker of blockers) {
+      if (angularSeparation(lat, lon, blocker.lat, blocker.lon) < blocker.minAngle) {
+        return false;
+      }
+    }
+    for (const existing of placements) {
+      if (angularSeparation(lat, lon, existing.lat, existing.lon) < minTreeSeparation) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const tryAddPlacement = (lat, lon) => {
+    if (isPlacementClear(lat, lon)) {
+      placements.push({ lat, lon });
+      return true;
+    }
+    return false;
+  };
+
   let attempts = 0;
-  while (placements.length < treesToPlace && attempts < treesToPlace * 12) {
+  const maxAttempts = treesToPlace * 30;
+  while (placements.length < treesToPlace && attempts < maxAttempts) {
     attempts++;
-    const lat = Math.PI * (0.08 + Math.random() * 0.30); // keep near top hemisphere
+    const hemisphere = Math.random() < 0.5 ? -1 : 1; // both hemispheres
+    const lat = hemisphere * (latMin + Math.random() * (latMax - latMin));
     const lon = Math.random() * Math.PI * 2;
-    const angle = angularSeparation(lat, lon, houseLat, houseLon);
-    if (angle < minAngleFromHouse) continue;
-    placements.push({ lat, lon });
+    tryAddPlacement(lat, lon);
   }
 
-  // Ensure some trees on the opposite side of the road/house
+  // Ensure some trees opposite the house/road, spreading across hemispheres
   const extra = [
     { lat: houseLat + 0.02, lon: houseLon + Math.PI },
-    { lat: houseLat - 0.05, lon: houseLon + Math.PI + 0.25 },
-    { lat: houseLat + 0.06, lon: houseLon + Math.PI - 0.2 },
+    { lat: -(houseLat + 0.05), lon: houseLon + Math.PI + 0.25 },
+    { lat: -(houseLat - 0.03), lon: houseLon + Math.PI - 0.2 },
   ];
-  placements.push(...extra);
+  extra.forEach((p) => tryAddPlacement(p.lat, p.lon));
 
   placements.forEach((p, idx) => {
     const n = noise.perlin2(Math.cos(p.lat + idx) * 2.3, Math.sin(p.lon + idx) * 2.3);
@@ -1041,4 +1346,450 @@ function createCylinder(radiusTop, radiusBottom, height, radialSubdiv) {
     indices.push(a, b, c, c, b, d);
   }
   return { positions, normals, indices };
+}
+
+// ---------- Background helpers ----------
+
+function initBackground(gl) {
+  // Quad geometry (clip-space)
+  const quadVerts = new Float32Array([
+    // x,   y,   u,  v
+    -1, -1, 0, 0,
+     1, -1, 1, 0,
+     1,  1, 1, 1,
+    -1,  1, 0, 1,
+  ]);
+  const quadIndices = new Uint16Array([0, 1, 2, 0, 2, 3]);
+
+  bgQuadVbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, bgQuadVbo);
+  gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
+
+  bgQuadIbo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bgQuadIbo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, quadIndices, gl.STATIC_DRAW);
+
+  bgProgram = createBackgroundProgram(gl);
+}
+
+function drawBackgroundGradient(gl) {
+  if (!bgProgram) return;
+  gl.useProgram(bgProgram.program);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, bgQuadVbo);
+  gl.enableVertexAttribArray(bgProgram.aPosition);
+  gl.vertexAttribPointer(bgProgram.aPosition, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(bgProgram.aUv);
+  gl.vertexAttribPointer(bgProgram.aUv, 2, gl.FLOAT, false, 16, 8);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bgQuadIbo);
+
+  // Pink sky across the dome
+  gl.uniform3fv(bgProgram.uTop, new Float32Array([0.90, 0.52, 0.80]));
+  gl.uniform3fv(bgProgram.uMid, new Float32Array([0.92, 0.58, 0.82]));
+  gl.uniform3fv(bgProgram.uBottom, new Float32Array([0.94, 0.60, 0.84]));
+  setCameraBasisUniforms(gl, bgProgram);
+
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+}
+
+function drawBackgroundClouds(gl) {
+  return; // clouds disabled
+}
+
+function createBackgroundProgram(gl) {
+  const vs = compileShader(gl, gl.VERTEX_SHADER, BG_VERTEX_SOURCE);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, BG_FRAGMENT_SOURCE);
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error("Background program link error:", gl.getProgramInfoLog(program));
+    return null;
+  }
+  return {
+    program,
+    aPosition: gl.getAttribLocation(program, "aPosition"),
+    aUv: gl.getAttribLocation(program, "aUv"),
+    uTop: gl.getUniformLocation(program, "uTop"),
+    uMid: gl.getUniformLocation(program, "uMid"),
+    uBottom: gl.getUniformLocation(program, "uBottom"),
+    uRight: gl.getUniformLocation(program, "uRight"),
+    uUp: gl.getUniformLocation(program, "uUp"),
+    uForward: gl.getUniformLocation(program, "uForward"),
+    uAspect: gl.getUniformLocation(program, "uAspect"),
+  };
+}
+
+function createCloudProgram(gl) {
+  return null; // clouds disabled
+}
+
+function createNoiseTexture(gl, size = 256) {
+  const data = new Uint8Array(size * size);
+  for (let i = 0; i < data.length; i++) {
+    data[i] = Math.floor(Math.random() * 256);
+  }
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, size, size, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  return tex;
+}
+
+function initClouds3D(gl) {
+  const clouds = createCloudBillboards(22, 1.25, -0.35, -0.9);
+  cloudBillboardCount = clouds.quadCount;
+
+  cloudBillboardVbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, cloudBillboardVbo);
+  gl.bufferData(gl.ARRAY_BUFFER, clouds.vertices, gl.STATIC_DRAW);
+
+  cloudBillboardIbo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cloudBillboardIbo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, clouds.indices, gl.STATIC_DRAW);
+
+  cloud3DProgram = createCloud3DProgram(gl);
+}
+
+function drawClouds3D(gl, view, projection) {
+  if (!cloud3DProgram || !cloudBillboardVbo) return;
+
+  gl.useProgram(cloud3DProgram.program);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, cloudBillboardVbo);
+  gl.enableVertexAttribArray(cloud3DProgram.aCenter);
+  gl.vertexAttribPointer(cloud3DProgram.aCenter, 3, gl.FLOAT, false, 28, 0);
+  gl.enableVertexAttribArray(cloud3DProgram.aOffset);
+  gl.vertexAttribPointer(cloud3DProgram.aOffset, 2, gl.FLOAT, false, 28, 12);
+  gl.enableVertexAttribArray(cloud3DProgram.aSize);
+  gl.vertexAttribPointer(cloud3DProgram.aSize, 1, gl.FLOAT, false, 28, 20);
+
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cloudBillboardIbo);
+
+  gl.uniformMatrix4fv(cloud3DProgram.uView, false, view);
+  gl.uniformMatrix4fv(cloud3DProgram.uProjection, false, projection);
+
+  const m = camera.view;
+  const right = [m[0], m[4], m[8]];
+  const up = [m[1], m[5], m[9]];
+  gl.uniform3fv(cloud3DProgram.uRight, new Float32Array(right));
+  gl.uniform3fv(cloud3DProgram.uUp, new Float32Array(up));
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, cloudNoiseTex);
+  gl.uniform1i(cloud3DProgram.uNoise, 0);
+
+  gl.uniform3fv(cloud3DProgram.uColor, new Float32Array([1.0, 0.92, 0.60]));
+  gl.uniform1f(cloud3DProgram.uSoftness, 0.6);
+  gl.uniform1f(cloud3DProgram.uAlpha, 0.8);
+
+  gl.drawElements(gl.TRIANGLES, cloudBillboardCount * 6, gl.UNSIGNED_SHORT, 0);
+}
+
+function createCloud3DProgram(gl) {
+  const vs = compileShader(gl, gl.VERTEX_SHADER, CLOUD3D_VERTEX_SOURCE);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, CLOUD3D_FRAGMENT_SOURCE);
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error("Cloud3D program link error:", gl.getProgramInfoLog(program));
+    return null;
+  }
+  return {
+    program,
+    aCenter: gl.getAttribLocation(program, "aCenter"),
+    aOffset: gl.getAttribLocation(program, "aOffset"),
+    aSize: gl.getAttribLocation(program, "aSize"),
+    uView: gl.getUniformLocation(program, "uView"),
+    uProjection: gl.getUniformLocation(program, "uProjection"),
+    uRight: gl.getUniformLocation(program, "uRight"),
+    uUp: gl.getUniformLocation(program, "uUp"),
+    uNoise: gl.getUniformLocation(program, "uNoise"),
+    uColor: gl.getUniformLocation(program, "uColor"),
+    uSoftness: gl.getUniformLocation(program, "uSoftness"),
+    uAlpha: gl.getUniformLocation(program, "uAlpha"),
+  };
+}
+
+function createCloudBillboards(count, radius, minY, maxY) {
+  const centers = [];
+  const offsets = [
+    [-1, -1],
+    [1, -1],
+    [1, 1],
+    [-1, 1],
+  ];
+  const vertices = [];
+  const indices = [];
+  for (let i = 0; i < count; i++) {
+    const theta = Math.random() * Math.PI * 2;
+    const y = Math.random() * (maxY - minY) + minY; // negative for southern band
+    const rXZ = Math.sqrt(Math.max(0, 1.0 - y * y)) * radius;
+    const x = Math.cos(theta) * rXZ;
+    const z = Math.sin(theta) * rXZ;
+    const size = 0.25 + Math.random() * 0.22;
+    centers.push([x, y, z, size]);
+  }
+
+  let vertIndex = 0;
+  for (const c of centers) {
+    for (const o of offsets) {
+      vertices.push(c[0], c[1], c[2], o[0], o[1], c[3]);
+    }
+    indices.push(
+      vertIndex + 0,
+      vertIndex + 1,
+      vertIndex + 2,
+      vertIndex + 0,
+      vertIndex + 2,
+      vertIndex + 3
+    );
+    vertIndex += 4;
+  }
+
+  return {
+    vertices: new Float32Array(vertices),
+    indices: new Uint16Array(indices),
+    quadCount: count,
+  };
+}
+
+function setCameraBasisUniforms(gl, programInfo) {
+  if (!programInfo.uRight || !programInfo.uUp || !programInfo.uForward || !programInfo.uAspect) return;
+  const m = camera.view;
+  // View matrix from lookAt: columns store camera basis; forward is negative Z column.
+  const right = [m[0], m[4], m[8]];
+  const up = [m[1], m[5], m[9]];
+  const forward = [-m[2], -m[6], -m[10]];
+  gl.uniform3fv(programInfo.uRight, new Float32Array(right));
+  gl.uniform3fv(programInfo.uUp, new Float32Array(up));
+  gl.uniform3fv(programInfo.uForward, new Float32Array(forward));
+  const aspect = gl.canvas.clientWidth / gl.canvas.clientHeight || 1;
+  gl.uniform1f(programInfo.uAspect, aspect);
+}
+
+// ---------- Orbiting sprite + trail ----------
+
+function initOrbiter(gl) {
+  orbProgram = createOrbProgram(gl);
+  orbTrailProgram = createOrbTrailProgram(gl);
+  orbTrailSpriteProgram = createOrbTrailSpriteProgram(gl);
+
+  // Billboard quad (shared)
+  const quad = new Float32Array([
+    // offset x, y
+    -1, -1,
+    1, -1,
+    1, 1,
+    -1, 1,
+  ]);
+  orbBillboardVbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, orbBillboardVbo);
+  gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+  // Trail buffers (dynamic quads)
+  orbTrailVbo = gl.createBuffer();
+  orbTrailIbo = gl.createBuffer();
+
+  // Seed trail with initial position
+  const p = currentOrbiterPosition();
+  orbState.trailPositions = [p];
+  orbState.trailDirty = true;
+}
+
+function updateOrbiter(dt) {
+  orbState.angle += orbState.angularSpeed * dt;
+  const p = currentOrbiterPosition();
+  const trail = orbState.trailPositions;
+  trail.push(p);
+  if (trail.length > orbState.trailMax) trail.shift();
+  orbState.trailDirty = true;
+}
+
+function currentOrbiterPosition() {
+  const a = orbState.angle;
+  const r = orbState.radius;
+  const h = orbState.height;
+  const x = Math.cos(a) * r;
+  const z = Math.sin(a) * r;
+  const y = h;
+  return [x, y, z];
+}
+
+function drawOrbiter(gl, view, projection) {
+  if (!orbProgram || !orbBillboardVbo) return;
+  gl.useProgram(orbProgram.program);
+
+  // Single center position
+  const center = currentOrbiterPosition();
+  gl.uniform3fv(orbProgram.uCenter, new Float32Array(center));
+  gl.uniformMatrix4fv(orbProgram.uView, false, view);
+  gl.uniformMatrix4fv(orbProgram.uProjection, false, projection);
+
+  // Camera basis
+  const m = camera.view;
+  const right = [m[0], m[4], m[8]];
+  const up = [m[1], m[5], m[9]];
+  gl.uniform3fv(orbProgram.uRight, new Float32Array(right));
+  gl.uniform3fv(orbProgram.uUp, new Float32Array(up));
+  gl.uniform1f(orbProgram.uSize, orbState.size);
+  gl.uniform3fv(orbProgram.uColorOuter, new Float32Array([1.0, 1.0, 1.0]));
+  gl.uniform3fv(orbProgram.uColorInner, new Float32Array([0.85, 0.85, 0.9]));
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, orbBillboardVbo);
+  gl.enableVertexAttribArray(orbProgram.aOffset);
+  gl.vertexAttribPointer(orbProgram.aOffset, 2, gl.FLOAT, false, 8, 0);
+
+  gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
+}
+
+function drawOrbiterTrail(gl, view, projection) {
+  if (!orbTrailSpriteProgram || !orbTrailVbo || !orbTrailIbo || !orbState.trailPositions.length) return;
+
+  // Rebuild trail quad geometry when dirty
+  if (orbState.trailDirty) {
+    const trail = orbState.trailPositions;
+    const count = trail.length;
+    const verts = new Float32Array(count * 4 * 7); // center xyz, offset xy, size, alpha
+    const indices = new Uint16Array(count * 6);
+    let vi = 0;
+    let ii = 0;
+    for (let i = 0; i < count; i++) {
+      const p = trail[i];
+      const t = i / (count - 1 || 1); // 0 = oldest (tail), 1 = newest (head)
+      // Sharper taper and brighter, fuller head
+      const alpha = Math.pow(t, 0.45) * 0.9;
+      const size = orbState.size * (0.14 + 0.95 * t); // thinner ribbon, distinct from orb
+      const offsets = [
+        [-1, -1],
+        [1, -1],
+        [1, 1],
+        [-1, 1],
+      ];
+      for (const o of offsets) {
+        verts[vi++] = p[0];
+        verts[vi++] = p[1];
+        verts[vi++] = p[2];
+        verts[vi++] = o[0];
+        verts[vi++] = o[1];
+        verts[vi++] = size;
+        verts[vi++] = alpha;
+      }
+      const base = i * 4;
+      indices[ii++] = base + 0;
+      indices[ii++] = base + 1;
+      indices[ii++] = base + 2;
+      indices[ii++] = base + 0;
+      indices[ii++] = base + 2;
+      indices[ii++] = base + 3;
+    }
+    orbTrailVertexCount = indices.length;
+    gl.bindBuffer(gl.ARRAY_BUFFER, orbTrailVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, orbTrailIbo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.DYNAMIC_DRAW);
+    orbState.trailDirty = false;
+  }
+
+  gl.useProgram(orbTrailSpriteProgram.program);
+  gl.uniformMatrix4fv(orbTrailSpriteProgram.uView, false, view);
+  gl.uniformMatrix4fv(orbTrailSpriteProgram.uProjection, false, projection);
+  gl.uniform3fv(orbTrailSpriteProgram.uColor, new Float32Array([1.0, 1.0, 1.0]));
+
+  const m = camera.view;
+  const right = [m[0], m[4], m[8]];
+  const up = [m[1], m[5], m[9]];
+  gl.uniform3fv(orbTrailSpriteProgram.uRight, new Float32Array(right));
+  gl.uniform3fv(orbTrailSpriteProgram.uUp, new Float32Array(up));
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, orbTrailVbo);
+  const stride = 7 * 4;
+  gl.enableVertexAttribArray(orbTrailSpriteProgram.aCenter);
+  gl.vertexAttribPointer(orbTrailSpriteProgram.aCenter, 3, gl.FLOAT, false, stride, 0);
+  gl.enableVertexAttribArray(orbTrailSpriteProgram.aOffset);
+  gl.vertexAttribPointer(orbTrailSpriteProgram.aOffset, 2, gl.FLOAT, false, stride, 12);
+  gl.enableVertexAttribArray(orbTrailSpriteProgram.aSize);
+  gl.vertexAttribPointer(orbTrailSpriteProgram.aSize, 1, gl.FLOAT, false, stride, 20);
+  gl.enableVertexAttribArray(orbTrailSpriteProgram.aAlpha);
+  gl.vertexAttribPointer(orbTrailSpriteProgram.aAlpha, 1, gl.FLOAT, false, stride, 24);
+
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, orbTrailIbo);
+  gl.drawElements(gl.TRIANGLES, orbTrailVertexCount, gl.UNSIGNED_SHORT, 0);
+}
+
+function createOrbProgram(gl) {
+  const vs = compileShader(gl, gl.VERTEX_SHADER, ORB_VERTEX_SOURCE);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, ORB_FRAGMENT_SOURCE);
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error("Orb program link error:", gl.getProgramInfoLog(program));
+    return null;
+  }
+  return {
+    program,
+    aOffset: gl.getAttribLocation(program, "aOffset"),
+    uCenter: gl.getUniformLocation(program, "uCenter"),
+    uView: gl.getUniformLocation(program, "uView"),
+    uProjection: gl.getUniformLocation(program, "uProjection"),
+    uRight: gl.getUniformLocation(program, "uRight"),
+    uUp: gl.getUniformLocation(program, "uUp"),
+    uSize: gl.getUniformLocation(program, "uSize"),
+    uColor: gl.getUniformLocation(program, "uColor"),
+  };
+}
+
+function createOrbTrailProgram(gl) {
+  const vs = compileShader(gl, gl.VERTEX_SHADER, ORB_TRAIL_VERTEX_SOURCE);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, ORB_TRAIL_FRAGMENT_SOURCE);
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error("Orb trail program link error:", gl.getProgramInfoLog(program));
+    return null;
+  }
+  return {
+    program,
+    aPosition: gl.getAttribLocation(program, "aPosition"),
+    aAlpha: gl.getAttribLocation(program, "aAlpha"),
+    uView: gl.getUniformLocation(program, "uView"),
+    uProjection: gl.getUniformLocation(program, "uProjection"),
+    uColor: gl.getUniformLocation(program, "uColor"),
+  };
+}
+
+function createOrbTrailSpriteProgram(gl) {
+  const vs = compileShader(gl, gl.VERTEX_SHADER, ORB_TRAIL_SPRITE_VERTEX_SOURCE);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, ORB_TRAIL_SPRITE_FRAGMENT_SOURCE);
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error("Orb trail sprite program link error:", gl.getProgramInfoLog(program));
+    return null;
+  }
+  return {
+    program,
+    aCenter: gl.getAttribLocation(program, "aCenter"),
+    aOffset: gl.getAttribLocation(program, "aOffset"),
+    aSize: gl.getAttribLocation(program, "aSize"),
+    aAlpha: gl.getAttribLocation(program, "aAlpha"),
+    uView: gl.getUniformLocation(program, "uView"),
+    uProjection: gl.getUniformLocation(program, "uProjection"),
+    uRight: gl.getUniformLocation(program, "uRight"),
+    uUp: gl.getUniformLocation(program, "uUp"),
+    uColor: gl.getUniformLocation(program, "uColor"),
+  };
 }
