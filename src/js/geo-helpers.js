@@ -148,3 +148,39 @@ export function buildPolarSphere(vertSteps = 10, horSteps = 12, radius = 1) {
   return { positions, indices, normals };
 }
 
+// Simple utilities for extrusion/scale/rotate of flat position arrays.
+export function extrudePositions(positions, dir) {
+  const out = positions.slice();
+  const [dx, dy, dz] = dir;
+  const baseCount = positions.length / 3;
+  for (let i = 0; i < baseCount; i++) {
+    const p = i * 3;
+    out.push(out[p] + dx, out[p + 1] + dy, out[p + 2] + dz);
+  }
+  return out;
+}
+
+export function scalePositions(positions, scale) {
+  const [sx, sy, sz] = Array.isArray(scale) ? scale : [scale, scale, scale];
+  const out = positions.slice();
+  for (let i = 0; i < out.length; i += 3) {
+    out[i] *= sx;
+    out[i + 1] *= sy;
+    out[i + 2] *= sz;
+  }
+  return out;
+}
+
+export function rotateYPositions(positions, rad) {
+  const out = positions.slice();
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  for (let i = 0; i < out.length; i += 3) {
+    const x = out[i];
+    const z = out[i + 2];
+    out[i] = z * sin + x * cos;
+    out[i + 2] = z * cos - x * sin;
+  }
+  return out;
+}
+

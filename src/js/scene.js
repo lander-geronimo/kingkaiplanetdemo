@@ -3,13 +3,26 @@
 
 const { mat4 } = window.glMatrix;
 // Helpers for procedural meshes
-import { buildBox, latheProfile, buildTriangleStripIndices } from "./geo-helpers.js";
+import {
+  buildBox,
+  latheProfile,
+  buildTriangleStripIndices,
+  extrudePositions,
+  scalePositions,
+  rotateYPositions,
+} from "./geo-helpers.js";
+import noise from "./noise.js";
 
 // Module-level state for the planet and its shader program
 let planet = null;
 let planetProgram = null;
 let house = null;
 let trees = [];
+let garage = null;
+let road = null;
+let roadStripes = [];
+let roadCap = null;
+let fountain = null;
 
 // Orbit camera state
 const camera = {
@@ -101,6 +114,9 @@ export function initScene(gl) {
   setupOrbitControls(gl.canvas);
   initPlanet(gl);
   initHouse(gl);
+  initGarage(gl);
+  initRoad(gl);
+  initFountain(gl);
   initTrees(gl);
 }
 
@@ -112,9 +128,15 @@ export function updateScene(gl, dt) {
 
 export function renderScene(gl) {
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.disable(gl.BLEND);
+  gl.depthMask(true);
+  gl.depthFunc(gl.LEQUAL);
 
   drawPlanet(gl, camera.view, camera.projection);
   drawHouse(gl, camera.view, camera.projection);
+  drawGarage(gl, camera.view, camera.projection);
+  drawRoad(gl, camera.view, camera.projection);
+  drawFountain(gl, camera.view, camera.projection);
   drawTrees(gl, camera.view, camera.projection);
 }
 
@@ -122,7 +144,15 @@ export function renderScene(gl) {
 export function drawPlanet(gl, view, projection) {
   if (!planet || !planetProgram) return;
 
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthMask(true);
+  gl.depthFunc(gl.LEQUAL);
+  gl.disable(gl.BLEND);
+
   gl.useProgram(planetProgram);
+
+  const cullEnabled = gl.isEnabled(gl.CULL_FACE);
+  if (cullEnabled) gl.disable(gl.CULL_FACE); // render double-sided to avoid missing faces
 
   // Bind position buffer
   gl.bindBuffer(gl.ARRAY_BUFFER, planet.positionBuffer);
@@ -167,6 +197,8 @@ export function drawPlanet(gl, view, projection) {
   );
 
   gl.drawElements(gl.TRIANGLES, planet.indexCount, gl.UNSIGNED_SHORT, 0);
+
+  if (cullEnabled) gl.enable(gl.CULL_FACE);
 }
 
 function drawHouse(gl, view, projection) {
@@ -241,6 +273,96 @@ function drawTrees(gl, view, projection) {
   if (cullEnabled) gl.enable(gl.CULL_FACE);
 }
 
+function drawGarage(gl, view, projection) {
+  if (!garage || !planetProgram) return;
+  gl.useProgram(planetProgram);
+  const cullEnabled = gl.isEnabled(gl.CULL_FACE);
+  if (cullEnabled) gl.disable(gl.CULL_FACE);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, garage.mesh.positionBuffer);
+  gl.enableVertexAttribArray(planetProgram.aPosition);
+  gl.vertexAttribPointer(planetProgram.aPosition, 3, gl.FLOAT, false, 0, 0);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, garage.mesh.normalBuffer);
+  gl.enableVertexAttribArray(planetProgram.aNormal);
+  gl.vertexAttribPointer(planetProgram.aNormal, 3, gl.FLOAT, false, 0, 0);
+
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, garage.mesh.indexBuffer);
+
+  gl.uniformMatrix4fv(planetProgram.uModel, false, garage.baseModel);
+  gl.uniformMatrix4fv(planetProgram.uView, false, view);
+  gl.uniformMatrix4fv(planetProgram.uProjection, false, projection);
+  gl.uniform3fv(planetProgram.uLightDirection, new Float32Array([-1.0, -1.0, -0.5]));
+  gl.uniform3fv(planetProgram.uBaseColor, new Float32Array(garage.color));
+
+  gl.drawElements(gl.TRIANGLES, garage.mesh.indexCount, gl.UNSIGNED_SHORT, 0);
+
+  if (cullEnabled) gl.enable(gl.CULL_FACE);
+}
+
+function drawRoad(gl, view, projection) {
+  if (!road || !planetProgram) return;
+  gl.useProgram(planetProgram);
+  const cullEnabled = gl.isEnabled(gl.CULL_FACE);
+  if (cullEnabled) gl.disable(gl.CULL_FACE);
+
+  const bands = [road, ...roadStripes, roadCap].filter(Boolean);
+  for (const band of bands) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, band.mesh.positionBuffer);
+    gl.enableVertexAttribArray(planetProgram.aPosition);
+    gl.vertexAttribPointer(planetProgram.aPosition, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, band.mesh.normalBuffer);
+    gl.enableVertexAttribArray(planetProgram.aNormal);
+    gl.vertexAttribPointer(planetProgram.aNormal, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, band.mesh.indexBuffer);
+
+    gl.uniformMatrix4fv(planetProgram.uModel, false, band.baseModel);
+    gl.uniformMatrix4fv(planetProgram.uView, false, view);
+    gl.uniformMatrix4fv(planetProgram.uProjection, false, projection);
+    gl.uniform3fv(planetProgram.uLightDirection, new Float32Array([-1.0, -1.0, -0.5]));
+    gl.uniform3fv(planetProgram.uBaseColor, new Float32Array(band.color));
+
+    gl.drawElements(gl.TRIANGLES, band.mesh.indexCount, gl.UNSIGNED_SHORT, 0);
+  }
+
+  if (cullEnabled) gl.enable(gl.CULL_FACE);
+}
+
+function drawFountain(gl, view, projection) {
+  if (!fountain || !planetProgram) return;
+  gl.useProgram(planetProgram);
+  const cullEnabled = gl.isEnabled(gl.CULL_FACE);
+  if (cullEnabled) gl.disable(gl.CULL_FACE);
+
+  const temp = mat4.create();
+  for (const part of fountain.parts) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, part.mesh.positionBuffer);
+    gl.enableVertexAttribArray(planetProgram.aPosition);
+    gl.vertexAttribPointer(planetProgram.aPosition, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, part.mesh.normalBuffer);
+    gl.enableVertexAttribArray(planetProgram.aNormal);
+    gl.vertexAttribPointer(planetProgram.aNormal, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, part.mesh.indexBuffer);
+
+    mat4.copy(temp, fountain.baseModel);
+    if (part.modelOffset) mat4.translate(temp, temp, part.modelOffset);
+
+    gl.uniformMatrix4fv(planetProgram.uModel, false, temp);
+    gl.uniformMatrix4fv(planetProgram.uView, false, view);
+    gl.uniformMatrix4fv(planetProgram.uProjection, false, projection);
+    gl.uniform3fv(planetProgram.uLightDirection, new Float32Array([-1.0, -1.0, -0.5]));
+    gl.uniform3fv(planetProgram.uBaseColor, new Float32Array(part.color));
+
+    gl.drawElements(gl.TRIANGLES, part.mesh.indexCount, gl.UNSIGNED_SHORT, 0);
+  }
+
+  if (cullEnabled) gl.enable(gl.CULL_FACE);
+}
+
 function initPlanet(gl) {
   // Radius 1.0 sphere, with moderate resolution
   const { positions, normals, indices } = createSphere(1.0, 32, 32);
@@ -278,18 +400,16 @@ function initPlanet(gl) {
 }
 
 function initHouse(gl) {
-  // Dome: true hemisphere
+  // Simpler stable version: hemisphere + box door
   const hemiRadius = 0.6;
   const domeGeom = createHemisphere(hemiRadius, 24, 32);
   const domeMesh = createMesh(gl, domeGeom);
 
-  // Door: rectangular box, protruding outward
-  const doorDims = { w: 0.18, h: 0.24, d: 0.08 };
+  const doorDims = { w: 0.22, h: 0.28, d: 0.10 }; // wider/taller/deeper box door
   const doorGeom = buildBox(doorDims);
   const doorMesh = createMesh(gl, doorGeom);
 
-  // Placement: scale and sink so base sits flush; door pushed outward
-  const scale = 0.38;
+  const scale = 0.36;
   const modelMatrix = buildSurfaceTransformScaled(
     1.0,
     Math.PI * 0.18,
@@ -297,13 +417,215 @@ function initHouse(gl) {
     hemiRadius,
     scale,
     0,
-    -0.45
+    -0.18
   );
+
+  const doorPush = hemiRadius * scale + doorDims.d * 3.4; // stronger protrusion to edge
 
   house = {
     parts: [
       { mesh: domeMesh, color: [1.0, 0.92, 0.55], modelOffset: [0, 0, 0] },
-      { mesh: doorMesh, color: [1.0, 1.0, 1.0], modelOffset: [0, doorDims.h * 0.5, hemiRadius + doorDims.d * 0.25] },
+      { mesh: doorMesh, color: [1.0, 1.0, 1.0], modelOffset: [0, doorDims.h * 0.6, doorPush] },
+    ],
+    baseModel: modelMatrix,
+  };
+}
+
+function initGarage(gl) {
+  // Simplified garage: small hemisphere
+  const gRadius = 0.32;
+  const garageGeom = createHemisphere(gRadius, 16, 24);
+  const garageMesh = createMesh(gl, garageGeom);
+
+  const scale = 0.26;
+  const modelMatrix = buildSurfaceTransformScaled(
+    1.0,
+    Math.PI * 0.22,  // a bit higher toward the top
+    Math.PI * 0.30 + Math.PI * 0.18, // offset from house, not overlapping fountain
+    gRadius,
+    scale,
+    0,
+    -0.30
+  );
+
+  garage = {
+    mesh: garageMesh,
+    color: [0.92, 0.88, 0.78],
+    baseModel: modelMatrix,
+  };
+}
+
+function initRoad(gl) {
+  // Belt hugging the planet along a latitude band
+  const latCenter = 0.0; // equatorial belt
+  const latHalf = 0.12; // wider band
+  const latTop = latCenter + latHalf;
+  const latBottom = latCenter - latHalf;
+  const steps = 128;
+  const positions = [];
+  const normals = [];
+  const indices = [];
+  const lift = 1.01; // small outward lift to avoid z-fighting with planet
+
+  for (let i = 0; i <= steps; i++) {
+    const lon = (i / steps) * Math.PI * 2;
+    const cosLon = Math.cos(lon);
+    const sinLon = Math.sin(lon);
+
+    // top edge
+    const xTop = Math.cos(latTop) * cosLon;
+    const yTop = Math.sin(latTop);
+    const zTop = Math.cos(latTop) * sinLon;
+    positions.push(xTop, yTop, zTop);
+    const lenTop = Math.hypot(xTop, yTop, zTop) || 1;
+    normals.push(xTop / lenTop, yTop / lenTop, zTop / lenTop);
+
+    // bottom edge
+    const xBot = Math.cos(latBottom) * cosLon;
+    const yBot = Math.sin(latBottom);
+    const zBot = Math.cos(latBottom) * sinLon;
+    positions.push(xBot, yBot, zBot);
+    const lenBot = Math.hypot(xBot, yBot, zBot) || 1;
+    normals.push(xBot / lenBot, yBot / lenBot, zBot / lenBot);
+  }
+
+  for (let i = 0; i < steps; i++) {
+    const a = i * 2;
+    const b = a + 1;
+    const c = a + 2;
+    const d = a + 3;
+    indices.push(a, b, c, c, b, d);
+  }
+
+  // Lift main road band outward
+  for (let i = 0; i < positions.length; i += 3) {
+    positions[i] *= lift;
+    positions[i + 1] *= lift;
+    positions[i + 2] *= lift;
+  }
+
+  const roadMesh = createMesh(gl, { positions, normals, indices });
+  const baseModel = mat4.create(); // centered; no extra rotation
+  road = {
+    mesh: roadMesh,
+    color: [0.7, 0.7, 0.7],
+    baseModel,
+  };
+
+  // Stripes alongside the road
+  roadStripes = [];
+  const stripeWidth = 0.02;
+  const stripeGap = 0.01;
+  const stripeHalf = stripeWidth * 0.5;
+  const stripeLift = 0.02;
+
+  const topCenter = latTop + stripeGap + stripeHalf;
+  const botCenter = latBottom - stripeGap - stripeHalf;
+  const stripeBand = (center) => {
+    const sTop = center + stripeHalf;
+    const sBot = center - stripeHalf;
+    const sPositions = [];
+    const sNormals = [];
+    const sIndices = [];
+    for (let i = 0; i <= steps; i++) {
+      const lon = (i / steps) * Math.PI * 2;
+      const cosLon = Math.cos(lon);
+      const sinLon = Math.sin(lon);
+
+      const xTop = Math.cos(sTop) * cosLon;
+      const yTop = Math.sin(sTop);
+      const zTop = Math.cos(sTop) * sinLon;
+      // Top row lifted outward
+      sPositions.push(xTop * (1 + stripeLift), yTop * (1 + stripeLift), zTop * (1 + stripeLift));
+      const lenTop = Math.hypot(xTop, yTop, zTop) || 1;
+      sNormals.push(xTop / lenTop, yTop / lenTop, zTop / lenTop);
+
+      const xBot = Math.cos(sBot) * cosLon;
+      const yBot = Math.sin(sBot);
+      const zBot = Math.cos(sBot) * sinLon;
+      // Bottom row stays on the surface to keep contact with planet
+      sPositions.push(xBot, yBot, zBot);
+      const lenBot = Math.hypot(xBot, yBot, zBot) || 1;
+      sNormals.push(xBot / lenBot, yBot / lenBot, zBot / lenBot);
+    }
+    for (let i = 0; i < steps; i++) {
+      const a = i * 2;
+      const b = a + 1;
+      const c = a + 2;
+      const d = a + 3;
+      sIndices.push(a, b, c, c, b, d);
+    }
+    // Lift stripe outward
+    for (let i = 0; i < sPositions.length; i += 3) {
+      sPositions[i] *= lift;
+      sPositions[i + 1] *= lift;
+      sPositions[i + 2] *= lift;
+    }
+    return createMesh(gl, { positions: sPositions, normals: sNormals, indices: sIndices });
+  };
+
+  roadStripes.push({
+    mesh: stripeBand(topCenter),
+    color: [0.6, 0.6, 0.6],
+    baseModel: mat4.create(),
+  });
+  roadStripes.push({
+    mesh: stripeBand(botCenter),
+    color: [0.6, 0.6, 0.6],
+    baseModel: mat4.create(),
+  });
+
+  // Cap to fill the middle (triangle fan from pole down to latTop)
+  const capSteps = steps;
+  const capPositions = [0, 1, 0]; // pole center
+  const capNormals = [0, 1, 0];
+  const capIndices = [];
+  const latCap = latTop;
+  for (let i = 0; i <= capSteps; i++) {
+    const lon = (i / capSteps) * Math.PI * 2;
+    const x = Math.cos(latCap) * Math.cos(lon);
+    const y = Math.sin(latCap);
+    const z = Math.cos(latCap) * Math.sin(lon);
+    capPositions.push(x * lift, y * lift, z * lift); // lift cap outward
+    const len = Math.hypot(x, y, z) || 1;
+    capNormals.push(x / len, y / len, z / len);
+  }
+  for (let i = 1; i <= capSteps; i++) {
+    capIndices.push(0, i, i + 1);
+  }
+  roadCap = {
+    mesh: createMesh(gl, { positions: capPositions, normals: capNormals, indices: capIndices }),
+    color: [0.7, 0.7, 0.7],
+    baseModel: mat4.create(),
+  };
+}
+
+function initFountain(gl) {
+  // Simplified fountain: short cylinder base + small sphere cap
+  const baseHeight = 0.08;
+  const baseRadius = 0.20;
+  const capRadius = 0.12;
+
+  const baseGeom = createCylinder(baseRadius, baseRadius, baseHeight, 20);
+  const capGeom = createSphere(capRadius, 12, 16);
+  const baseMesh = createMesh(gl, baseGeom);
+  const capMesh = createMesh(gl, capGeom);
+
+  const scale = 0.38;
+  const modelMatrix = buildSurfaceTransformScaled(
+    1.0,
+    Math.PI * 0.24,  // slightly higher toward top
+    Math.PI * 0.30 - Math.PI * 0.18, // opposite side from garage
+    baseHeight + capRadius,
+    scale,
+    0,
+    -0.08
+  );
+
+  fountain = {
+    parts: [
+      { mesh: baseMesh, color: [0.9, 0.9, 0.95], modelOffset: [0, baseHeight * 0.5, 0] },
+      { mesh: capMesh, color: [0.85, 0.85, 0.95], modelOffset: [0, baseHeight + capRadius * 0.8, 0] },
     ],
     baseModel: modelMatrix,
   };
@@ -311,31 +633,58 @@ function initHouse(gl) {
 
 function initTrees(gl) {
   trees = [];
-  const trunkHeight = 0.35;
-  const trunkRadius = 0.06;
-  const foliageRadius = 0.18;
 
-  const trunkGeom = createCylinder(trunkRadius, trunkRadius, trunkHeight, 12);
+  // Bonsai-like: tapered trunk + layered foliage blobs
+  const baseTrunkHeight = 0.28;
+  const baseTrunkRadiusBottom = 0.05;
+  const baseTrunkRadiusTop = 0.03;
+  const baseFoliageRadius = 0.10;
+
+  const trunkGeom = createCylinder(baseTrunkRadiusTop, baseTrunkRadiusBottom, baseTrunkHeight, 10);
   const trunkMesh = createMesh(gl, trunkGeom);
-
-  const foliageGeom = createSphere(foliageRadius, 12, 16);
+  const foliageGeom = createSphere(baseFoliageRadius, 10, 12);
   const foliageMesh = createMesh(gl, foliageGeom);
 
-  // A few sample trees around the house
-  const placements = [
-    { lat: Math.PI * 0.20, lon: Math.PI * 0.32 },
-    { lat: Math.PI * 0.16, lon: Math.PI * 0.28 },
-    { lat: Math.PI * 0.22, lon: Math.PI * 0.26 },
-  ];
+  // Procedurally distribute trees around the planet, avoiding the house area
+  const treesToPlace = 18;
+  const houseLat = Math.PI * 0.18;
+  const houseLon = Math.PI * 0.3;
+  const minAngleFromHouse = 0.32; // radians
+  const placements = [];
 
-  const scale = 0.6;
-  placements.forEach((p) => {
-    const model = buildSurfaceTransformScaled(1.0, p.lat, p.lon, trunkHeight + foliageRadius, scale, 0, -0.1);
+  let attempts = 0;
+  while (placements.length < treesToPlace && attempts < treesToPlace * 12) {
+    attempts++;
+    const lat = Math.PI * (0.08 + Math.random() * 0.30); // keep near top hemisphere
+    const lon = Math.random() * Math.PI * 2;
+    const angle = angularSeparation(lat, lon, houseLat, houseLon);
+    if (angle < minAngleFromHouse) continue;
+    placements.push({ lat, lon });
+  }
+
+  // Ensure some trees on the opposite side of the road/house
+  const extra = [
+    { lat: houseLat + 0.02, lon: houseLon + Math.PI },
+    { lat: houseLat - 0.05, lon: houseLon + Math.PI + 0.25 },
+    { lat: houseLat + 0.06, lon: houseLon + Math.PI - 0.2 },
+  ];
+  placements.push(...extra);
+
+  placements.forEach((p, idx) => {
+    const n = noise.perlin2(Math.cos(p.lat + idx) * 2.3, Math.sin(p.lon + idx) * 2.3);
+    const scaleJitter = 0.9 + 0.25 * n;
+    const trunkHeight = baseTrunkHeight * scaleJitter;
+    const foliageRadius = baseFoliageRadius * (0.9 + 0.3 * noise.perlin2(p.lat * 3.1, p.lon * 3.7));
+    const modelScale = 0.55 * scaleJitter;
+    const model = buildSurfaceTransformScaled(1.0, p.lat, p.lon, trunkHeight + foliageRadius, modelScale, 0, -0.12);
+
     trees.push({
       model,
       parts: [
         { mesh: trunkMesh, color: [0.55, 0.35, 0.2], offset: [0, trunkHeight * 0.5, 0] },
-        { mesh: foliageMesh, color: [0.1, 0.6, 0.1], offset: [0, trunkHeight + foliageRadius * 0.6, 0] },
+        { mesh: foliageMesh, color: [0.10, 0.60, 0.10], offset: [0.04, trunkHeight + foliageRadius * 0.3, 0] },
+        { mesh: foliageMesh, color: [0.10, 0.65, 0.12], offset: [-0.03, trunkHeight + foliageRadius * 0.8, 0.03] },
+        { mesh: foliageMesh, color: [0.12, 0.58, 0.10], offset: [0.01, trunkHeight + foliageRadius * 1.25, -0.04] },
       ],
     });
   });
@@ -396,6 +745,14 @@ function buildSurfaceTransformScaled(radius, lat, lon, baseHeight, scale, yawAro
   if (yawAroundUp !== 0) mat4.rotate(m, m, yawAroundUp, up);
   mat4.scale(m, m, [scale, scale, scale]);
   return m;
+}
+
+// Angular separation between two lat/lon points (radians)
+function angularSeparation(lat1, lon1, lat2, lon2) {
+  const sin1 = Math.sin(lat1), cos1 = Math.cos(lat1);
+  const sin2 = Math.sin(lat2), cos2 = Math.cos(lat2);
+  const dLon = lon1 - lon2;
+  return Math.acos(sin1 * sin2 + cos1 * cos2 * Math.cos(dLon));
 }
 
 function computeNormals(positions, indices) {
