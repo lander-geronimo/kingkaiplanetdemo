@@ -23,6 +23,7 @@ let road = null;
 let roadStripes = [];
 let roadCap = null;
 let fountain = null;
+let glRef = null;
 
 // Background (gradient + clouds) state
 let bgProgram = null;
@@ -41,16 +42,102 @@ let orbBillboardVbo = null;
 let orbTrailVbo = null;
 let orbTrailIbo = null;
 let orbTrailVertexCount = 0;
-const orbState = {
-  angle: 0,
-  angularSpeed: 0.6, // radians/sec
-  radius: 1.6,
-  height: 0.2,
-  size: 0.07,
-  trailMax: 160,
-  trailPositions: [],
-  trailDirty: true,
-};
+let orbStates = [];
+let orbCount = 3;
+let retiredTrails = [];
+
+function createOrbState() {
+  return {
+    angle: Math.random() * Math.PI * 2,
+    angularSpeed: 0.6, // radians/sec
+    radius: 1.6,
+    height: 0.2,
+    size: 0.07,
+    trailMax: 220,
+    trailPositions: [],
+    trailDirty: true,
+    direction: Math.random() < 0.5 ? -1 : 1,
+    targetAngularSpeed: 0.6,
+    targetRadius: 1.6,
+    targetHeight: 0.2,
+    segmentTime: 0,
+    segmentDuration: 1.4,
+    pauseTimer: 0,
+    pauseDuration: 0,
+    isPaused: false,
+    wobblePhaseA: Math.random() * Math.PI * 2,
+    wobblePhaseB: Math.random() * Math.PI * 2,
+    renderRadius: 1.6,
+    renderHeight: 0.2,
+    planeNormal: randomUnitVec3(),
+    targetPlaneNormal: [0, 1, 0],
+    teleportPlanned: false,
+    teleportDone: false,
+    skipTrailInterpolation: false,
+  };
+}
+
+const ORBIT_MIN_RADIUS = 1.15;
+const ORBIT_MAX_RADIUS = 2.05;
+const ORBIT_MIN_HEIGHT = -0.35;
+const ORBIT_MAX_HEIGHT = 0.75;
+const TELEPORT_BREAK_DIST = 0.55;
+
+function clampOrbit(v, min, max) {
+  return Math.min(Math.max(v, min), max);
+}
+
+function randomRange(min, max) {
+  return Math.random() * (max - min) + min;
+}
+
+function randomUnitVec3() {
+  // Marsaglia method
+  const u = randomRange(-1, 1);
+  const theta = randomRange(0, Math.PI * 2);
+  const s = Math.sqrt(1 - u * u);
+  return [s * Math.cos(theta), u, s * Math.sin(theta)];
+}
+
+function lerpVec3(out, a, b, t) {
+  out[0] = a[0] + (b[0] - a[0]) * t;
+  out[1] = a[1] + (b[1] - a[1]) * t;
+  out[2] = a[2] + (b[2] - a[2]) * t;
+  return out;
+}
+
+function normalizeVec3(v) {
+  const len = Math.hypot(v[0], v[1], v[2]) || 1;
+  v[0] /= len;
+  v[1] /= len;
+  v[2] /= len;
+  return v;
+}
+
+function pickNewFlightSegment(orbState, forceFlip = false) {
+  if (forceFlip || Math.random() < 0.35) {
+    orbState.direction *= -1;
+  }
+  orbState.segmentTime = 0;
+  orbState.segmentDuration = randomRange(0.9, 2.4);
+  orbState.targetAngularSpeed = randomRange(0.35, 1.8);
+
+  const nextRadius = randomRange(1.25, 1.95);
+  orbState.targetRadius = clampOrbit(nextRadius, ORBIT_MIN_RADIUS, ORBIT_MAX_RADIUS);
+
+  const anywhere = randomRange(-0.32, 0.62);
+  const lift = Math.sin(orbState.wobblePhaseA * 0.5 + Math.random() * 0.6) * 0.08;
+  const nextHeight = anywhere + lift;
+  orbState.targetHeight = clampOrbit(nextHeight, ORBIT_MIN_HEIGHT, ORBIT_MAX_HEIGHT);
+
+  // Occasionally pick a completely new orbit plane so he can loop over poles
+  if (forceFlip || Math.random() < 0.6) {
+    orbState.targetPlaneNormal = randomUnitVec3();
+  }
+
+  orbState.teleportPlanned = false;
+  orbState.teleportDone = false;
+}
 
 // Orbit camera state
 const camera = {
@@ -67,6 +154,14 @@ const camera = {
   lastMouseY: 0,
   rotationSpeed: 0.0035,
   zoomSpeed: 0.15,
+};
+const cameraInput = {
+  left: false,
+  right: false,
+  up: false,
+  down: false,
+  zoomIn: false,
+  zoomOut: false,
 };
 
 // Vertex / fragment shader sources for the planet
@@ -338,6 +433,7 @@ void main() {
 `;
 
 export function initScene(gl) {
+  glRef = gl;
   console.log("Scene initialized");
 
   // Rendering setup
@@ -357,7 +453,7 @@ export function initScene(gl) {
   initRoad(gl);
   initFountain(gl);
   initTrees(gl);
-  initOrbiter(gl);
+  initOrbiters(gl);
 }
 
 export function updateScene(gl, dt) {
@@ -365,7 +461,73 @@ export function updateScene(gl, dt) {
   updateCameraMatrices(gl);
   spinPlanet(dt);
   bgTime += dt;
-  updateOrbiter(dt);
+  applyCameraKeyboard(dt);
+  updateOrbiters(dt);
+  decayRetiredTrails(dt);
+}
+
+export function getCameraState() {
+  return {
+    theta: camera.theta,
+    phi: camera.phi,
+    radius: camera.radius,
+    minRadius: camera.minRadius,
+    maxRadius: camera.maxRadius,
+  };
+}
+
+export function setCameraState({ theta, phi, radius }) {
+  if (typeof theta === "number") camera.theta = theta;
+  if (typeof phi === "number") camera.phi = Math.max(0.1, Math.min(Math.PI - 0.1, phi));
+  if (typeof radius === "number") {
+    camera.radius = Math.max(camera.minRadius, Math.min(camera.maxRadius, radius));
+  }
+}
+
+export function getOrbCount() {
+  return orbCount;
+}
+
+export function setOrbCount(count) {
+  const next = Math.max(1, Math.min(20, Math.floor(count || 1)));
+  if (!glRef) {
+    orbCount = next;
+    return;
+  }
+
+  if (!orbStates || !orbStates.length) {
+    orbCount = next;
+    initOrbiters(glRef);
+    return;
+  }
+
+  if (next > orbStates.length) {
+    const toAdd = next - orbStates.length;
+    for (let i = 0; i < toAdd; i++) {
+      const state = createOrbState();
+      const p = currentOrbiterPosition(state);
+      state.trailPositions = [p];
+      state.trailDirty = true;
+      pickNewFlightSegment(state, true);
+      orbStates.push(state);
+    }
+  } else if (next < orbStates.length) {
+    while (orbStates.length > next) {
+      const removed = orbStates.pop();
+      if (removed && removed.trailPositions?.length) {
+        retiredTrails.push({
+          trailPositions: removed.trailPositions.slice(),
+          size: removed.size,
+          alphaScale: 1,
+          fade: 1.2, // seconds to fade out
+          trailDirty: true,
+          trailIndexCount: removed.trailIndexCount || 0,
+        });
+      }
+    }
+  }
+
+  orbCount = next;
 }
 
 export function renderScene(gl) {
@@ -900,15 +1062,15 @@ function initFountain(gl) {
 function initTrees(gl) {
   trees = [];
 
-  // Bonsai-like: tapered trunk + layered foliage blobs
-  const baseTrunkHeight = 0.28;
-  const baseTrunkRadiusBottom = 0.05;
-  const baseTrunkRadiusTop = 0.03;
-  const baseFoliageRadius = 0.10;
+  // Broccoli-like: short pale trunk with fuller, larger crowns
+  const baseTrunkHeight = 0.22;
+  const baseTrunkRadiusBottom = 0.055;
+  const baseTrunkRadiusTop = 0.04;
+  const baseFoliageRadius = 0.16;
 
-  const trunkGeom = createCylinder(baseTrunkRadiusTop, baseTrunkRadiusBottom, baseTrunkHeight, 10);
+  const trunkGeom = createCylinder(baseTrunkRadiusTop, baseTrunkRadiusBottom, baseTrunkHeight, 12);
   const trunkMesh = createMesh(gl, trunkGeom);
-  const foliageGeom = createSphere(baseFoliageRadius, 10, 12);
+  const foliageGeom = createSphere(baseFoliageRadius, 12, 14);
   const foliageMesh = createMesh(gl, foliageGeom);
 
   // Procedurally distribute trees around the planet, avoiding other objects
@@ -979,17 +1141,17 @@ function initTrees(gl) {
     const n = noise.perlin2(Math.cos(p.lat + idx) * 2.3, Math.sin(p.lon + idx) * 2.3);
     const scaleJitter = 0.9 + 0.25 * n;
     const trunkHeight = baseTrunkHeight * scaleJitter;
-    const foliageRadius = baseFoliageRadius * (0.9 + 0.3 * noise.perlin2(p.lat * 3.1, p.lon * 3.7));
-    const modelScale = 0.55 * scaleJitter;
+    const foliageRadius = baseFoliageRadius * (0.92 + 0.28 * noise.perlin2(p.lat * 3.1, p.lon * 3.7));
+    const modelScale = 0.58 * scaleJitter;
     const model = buildSurfaceTransformScaled(1.0, p.lat, p.lon, trunkHeight + foliageRadius, modelScale, 0, -0.12);
 
     trees.push({
       model,
       parts: [
-        { mesh: trunkMesh, color: [0.55, 0.35, 0.2], offset: [0, trunkHeight * 0.5, 0] },
-        { mesh: foliageMesh, color: [0.10, 0.60, 0.10], offset: [0.04, trunkHeight + foliageRadius * 0.3, 0] },
-        { mesh: foliageMesh, color: [0.10, 0.65, 0.12], offset: [-0.03, trunkHeight + foliageRadius * 0.8, 0.03] },
-        { mesh: foliageMesh, color: [0.12, 0.58, 0.10], offset: [0.01, trunkHeight + foliageRadius * 1.25, -0.04] },
+        { mesh: trunkMesh, color: [0.94, 0.92, 0.88], offset: [0, trunkHeight * 0.5, 0] },
+        { mesh: foliageMesh, color: [0.11, 0.55, 0.11], offset: [0.03, trunkHeight + foliageRadius * 0.35, 0.02] },
+        { mesh: foliageMesh, color: [0.13, 0.60, 0.12], offset: [-0.02, trunkHeight + foliageRadius * 0.85, 0.03] },
+        { mesh: foliageMesh, color: [0.10, 0.50, 0.10], offset: [0.02, trunkHeight + foliageRadius * 1.35, -0.03] },
       ],
     });
   });
@@ -1108,6 +1270,8 @@ function setupOrbitControls(canvas) {
   window.addEventListener("mouseup", handleMouseUp);
   window.addEventListener("mousemove", handleMouseMove);
   canvas.addEventListener("wheel", handleWheel, { passive: false });
+  window.addEventListener("keydown", handleKeyDown);
+  window.addEventListener("keyup", handleKeyUp);
 }
 
 function handleMouseDown(event) {
@@ -1151,6 +1315,81 @@ function handleWheel(event) {
     camera.minRadius,
     Math.min(camera.maxRadius, camera.radius + delta)
   );
+}
+
+function handleKeyDown(event) {
+  switch (event.key.toLowerCase()) {
+    case "a":
+    case "arrowleft":
+      cameraInput.left = true;
+      break;
+    case "d":
+    case "arrowright":
+      cameraInput.right = true;
+      break;
+    case "w":
+    case "arrowup":
+      cameraInput.up = true;
+      break;
+    case "s":
+    case "arrowdown":
+      cameraInput.down = true;
+      break;
+    case "q":
+    case "-":
+      cameraInput.zoomIn = true;
+      break;
+    case "e":
+    case "+":
+    case "=":
+      cameraInput.zoomOut = true;
+      break;
+    default:
+      break;
+  }
+}
+
+function handleKeyUp(event) {
+  switch (event.key.toLowerCase()) {
+    case "a":
+    case "arrowleft":
+      cameraInput.left = false;
+      break;
+    case "d":
+    case "arrowright":
+      cameraInput.right = false;
+      break;
+    case "w":
+    case "arrowup":
+      cameraInput.up = false;
+      break;
+    case "s":
+    case "arrowdown":
+      cameraInput.down = false;
+      break;
+    case "q":
+    case "-":
+      cameraInput.zoomIn = false;
+      break;
+    case "e":
+    case "+":
+    case "=":
+      cameraInput.zoomOut = false;
+      break;
+    default:
+      break;
+  }
+}
+
+function applyCameraKeyboard(dt) {
+  const rotSpeed = 1.4 * dt;
+  const zoomDelta = camera.zoomSpeed * 1.2;
+  if (cameraInput.left) camera.theta -= rotSpeed;
+  if (cameraInput.right) camera.theta += rotSpeed;
+  if (cameraInput.up) camera.phi = Math.max(0.1, camera.phi - rotSpeed);
+  if (cameraInput.down) camera.phi = Math.min(Math.PI - 0.1, camera.phi + rotSpeed);
+  if (cameraInput.zoomIn) camera.radius = Math.max(camera.minRadius, camera.radius - zoomDelta);
+  if (cameraInput.zoomOut) camera.radius = Math.min(camera.maxRadius, camera.radius + zoomDelta);
 }
 
 function updateCameraMatrices(gl) {
@@ -1383,10 +1622,10 @@ function drawBackgroundGradient(gl) {
   gl.vertexAttribPointer(bgProgram.aUv, 2, gl.FLOAT, false, 16, 8);
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bgQuadIbo);
 
-  // Pink sky across the dome
-  gl.uniform3fv(bgProgram.uTop, new Float32Array([0.90, 0.52, 0.80]));
-  gl.uniform3fv(bgProgram.uMid, new Float32Array([0.92, 0.58, 0.82]));
-  gl.uniform3fv(bgProgram.uBottom, new Float32Array([0.94, 0.60, 0.84]));
+  // Sky gradient: pink upper half blending to warm yellow lower half
+  gl.uniform3fv(bgProgram.uTop, new Float32Array([0.94, 0.60, 0.88]));   // dominant pink
+  gl.uniform3fv(bgProgram.uMid, new Float32Array([0.95, 0.66, 0.84]));   // pink-heavy transition
+  gl.uniform3fv(bgProgram.uBottom, new Float32Array([0.96, 0.74, 0.70])); // pink-washed yellow at the base
   setCameraBasisUniforms(gl, bgProgram);
 
   gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
@@ -1577,7 +1816,7 @@ function setCameraBasisUniforms(gl, programInfo) {
 
 // ---------- Orbiting sprite + trail ----------
 
-function initOrbiter(gl) {
+function initOrbiters(gl) {
   orbProgram = createOrbProgram(gl);
   orbTrailProgram = createOrbTrailProgram(gl);
   orbTrailSpriteProgram = createOrbTrailSpriteProgram(gl);
@@ -1598,40 +1837,207 @@ function initOrbiter(gl) {
   orbTrailVbo = gl.createBuffer();
   orbTrailIbo = gl.createBuffer();
 
-  // Seed trail with initial position
-  const p = currentOrbiterPosition();
-  orbState.trailPositions = [p];
-  orbState.trailDirty = true;
+  // Seed states
+  orbStates = [];
+  for (let i = 0; i < orbCount; i++) {
+    const state = createOrbState();
+    const p = currentOrbiterPosition(state);
+    state.trailPositions = [p];
+    state.trailDirty = true;
+    pickNewFlightSegment(state, true);
+    orbStates.push(state);
+  }
 }
 
-function updateOrbiter(dt) {
-  orbState.angle += orbState.angularSpeed * dt;
-  const p = currentOrbiterPosition();
+function updateOrbiters(dt) {
+  for (const orb of orbStates) {
+    updateSingleOrb(orb, dt);
+  }
+  resolveOrbCollisions();
+}
+
+function decayRetiredTrails(dt) {
+  if (!retiredTrails.length) return;
+  for (let i = retiredTrails.length - 1; i >= 0; i--) {
+    const r = retiredTrails[i];
+    r.fade -= dt;
+    if (r.fade <= 0) {
+      retiredTrails.splice(i, 1);
+    } else {
+      r.alphaScale = Math.max(0, r.fade / 1.2);
+      r.trailDirty = true;
+    }
+  }
+}
+
+function updateSingleOrb(orbState, dt) {
+  // Layered wobble for erratic movement without clipping the planet
+  orbState.wobblePhaseA += dt * 2.6;
+  orbState.wobblePhaseB += dt * 3.7;
+
+  // Smoothly reorient the orbit plane toward its target
+  lerpVec3(orbState.planeNormal, orbState.planeNormal, orbState.targetPlaneNormal, Math.min(1, dt * 1.8));
+  normalizeVec3(orbState.planeNormal);
+
+  if (orbState.isPaused) {
+    orbState.pauseTimer -= dt;
+    // Mid-hover chance to intentionally teleport
+    if (
+      orbState.teleportPlanned &&
+      !orbState.teleportDone &&
+      orbState.pauseTimer <= orbState.pauseDuration * 0.4
+    ) {
+      performTeleport(orbState);
+      orbState.teleportDone = true;
+    }
+    orbState.angularSpeed += (0 - orbState.angularSpeed) * Math.min(1, dt * 6);
+    if (orbState.pauseTimer <= 0) {
+      orbState.isPaused = false;
+      pickNewFlightSegment(orbState);
+    }
+  } else {
+    const speedJitter = 1 + 0.35 * Math.sin(orbState.wobblePhaseA * 0.7);
+    const targetSpeed = orbState.targetAngularSpeed * speedJitter;
+    orbState.angularSpeed += (targetSpeed - orbState.angularSpeed) * Math.min(1, dt * 3.5);
+    orbState.angle += orbState.angularSpeed * orbState.direction * dt;
+
+    orbState.radius += (orbState.targetRadius - orbState.radius) * Math.min(1, dt * 2.2);
+    orbState.height += (orbState.targetHeight - orbState.height) * Math.min(1, dt * 2.2);
+
+    orbState.segmentTime += dt;
+    if (orbState.segmentTime >= orbState.segmentDuration) {
+      if (Math.random() < 0.3) {
+        orbState.isPaused = true;
+        orbState.pauseDuration = randomRange(0.35, 0.9);
+        orbState.pauseTimer = orbState.pauseDuration;
+        orbState.teleportPlanned = Math.random() < 0.45; // sometimes he blinks to a new line mid-hover
+        orbState.teleportDone = false;
+        orbState.segmentTime = 0;
+      } else {
+        pickNewFlightSegment(orbState);
+      }
+    }
+  }
+
+  // Apply wobble and safety clamps to keep above the surface
+  const radialWobble =
+    Math.sin(orbState.wobblePhaseA) * 0.08 +
+    Math.sin(orbState.wobblePhaseB + 1.1) * 0.05;
+  const verticalWobble =
+    Math.sin(orbState.wobblePhaseA * 1.3 + 0.4) * 0.05 +
+    Math.sin(orbState.wobblePhaseB * 0.6 + 1.1) * 0.035;
+
+  orbState.renderRadius = clampOrbit(
+    orbState.radius + radialWobble,
+    ORBIT_MIN_RADIUS,
+    ORBIT_MAX_RADIUS
+  );
+  orbState.renderHeight = clampOrbit(
+    orbState.height + verticalWobble,
+    ORBIT_MIN_HEIGHT,
+    ORBIT_MAX_HEIGHT
+  );
+
+  const p = currentOrbiterPosition(orbState);
   const trail = orbState.trailPositions;
-  trail.push(p);
-  if (trail.length > orbState.trailMax) trail.shift();
+  const last = trail[trail.length - 1] || p;
+
+  const dx = p[0] - last[0];
+  const dy = p[1] - last[1];
+  const dz = p[2] - last[2];
+  const dist = Math.hypot(dx, dy, dz);
+
+  if (orbState.skipTrailInterpolation || dist > TELEPORT_BREAK_DIST) {
+    trail.push(p);
+    orbState.skipTrailInterpolation = false;
+  } else {
+    const maxGap = 0.045; // tighter spacing at high speed to avoid dotting
+    const steps = Math.max(1, Math.ceil(dist / maxGap));
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const lerped = [
+        last[0] + dx * t,
+        last[1] + dy * t,
+        last[2] + dz * t,
+      ];
+      trail.push(lerped);
+    }
+  }
+
+  while (trail.length > orbState.trailMax) trail.shift();
   orbState.trailDirty = true;
 }
 
-function currentOrbiterPosition() {
+function resolveOrbCollisions() {
+  const minDist = 0.18; // approximate sprite diameter for bounce
+  for (let i = 0; i < orbStates.length; i++) {
+    for (let j = i + 1; j < orbStates.length; j++) {
+      const a = currentOrbiterPosition(orbStates[i]);
+      const b = currentOrbiterPosition(orbStates[j]);
+      const dx = b[0] - a[0];
+      const dy = b[1] - a[1];
+      const dz = b[2] - a[2];
+      const dist = Math.hypot(dx, dy, dz);
+      if (dist > 0 && dist < minDist) {
+        // simple bounce: push apart and flip directions
+        const overlap = (minDist - dist) * 0.5;
+        const nx = dx / dist;
+        const ny = dy / dist;
+        const nz = dz / dist;
+        orbStates[i].renderRadius += overlap * 0.05;
+        orbStates[j].renderRadius += overlap * 0.05;
+        orbStates[i].direction *= -1;
+        orbStates[j].direction *= -1;
+        orbStates[i].angle += 0.2;
+        orbStates[j].angle -= 0.2;
+      }
+    }
+  }
+}
+
+function currentOrbiterPosition(orbState) {
   const a = orbState.angle;
-  const r = orbState.radius;
-  const h = orbState.height;
-  const x = Math.cos(a) * r;
-  const z = Math.sin(a) * r;
-  const y = h;
+  const r = orbState.renderRadius ?? orbState.radius;
+  const h = orbState.renderHeight ?? orbState.height;
+
+  // Build an orthonormal basis for the orbit plane so he can fly over any latitude
+  const n = orbState.planeNormal;
+  // Pick a helper vector that is not parallel to n
+  const helper = Math.abs(n[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+  const right = normalizeVec3([
+    n[1] * helper[2] - n[2] * helper[1],
+    n[2] * helper[0] - n[0] * helper[2],
+    n[0] * helper[1] - n[1] * helper[0],
+  ]);
+  const forward = [
+    right[1] * n[2] - right[2] * n[1],
+    right[2] * n[0] - right[0] * n[2],
+    right[0] * n[1] - right[1] * n[0],
+  ];
+
+  const x = right[0] * Math.cos(a) * r + forward[0] * Math.sin(a) * r + n[0] * h;
+  const y = right[1] * Math.cos(a) * r + forward[1] * Math.sin(a) * r + n[1] * h;
+  const z = right[2] * Math.cos(a) * r + forward[2] * Math.sin(a) * r + n[2] * h;
   return [x, y, z];
 }
 
-function drawOrbiter(gl, view, projection) {
-  if (!orbProgram || !orbBillboardVbo) return;
-  gl.useProgram(orbProgram.program);
+function performTeleport(orbState) {
+  // Pick a new plane, radius/height, and angle, then reset the trail so the jump looks intentional.
+  const newNormal = randomUnitVec3();
+  orbState.planeNormal = normalizeVec3(newNormal.slice());
+  orbState.targetPlaneNormal = orbState.planeNormal.slice();
 
-  // Single center position
-  const center = currentOrbiterPosition();
-  gl.uniform3fv(orbProgram.uCenter, new Float32Array(center));
-  gl.uniformMatrix4fv(orbProgram.uView, false, view);
-  gl.uniformMatrix4fv(orbProgram.uProjection, false, projection);
+  orbState.angle = randomRange(0, Math.PI * 2);
+  orbState.radius = orbState.renderRadius = clampOrbit(randomRange(1.2, 1.95), ORBIT_MIN_RADIUS, ORBIT_MAX_RADIUS);
+  orbState.height = orbState.renderHeight = clampOrbit(randomRange(-0.25, 0.55), ORBIT_MIN_HEIGHT, ORBIT_MAX_HEIGHT);
+
+  // Next trail update should not interpolate across the jump
+  orbState.skipTrailInterpolation = true;
+}
+
+function drawOrbiter(gl, view, projection) {
+  if (!orbProgram || !orbBillboardVbo || !orbStates.length) return;
+  gl.useProgram(orbProgram.program);
 
   // Camera basis
   const m = camera.view;
@@ -1639,64 +2045,27 @@ function drawOrbiter(gl, view, projection) {
   const up = [m[1], m[5], m[9]];
   gl.uniform3fv(orbProgram.uRight, new Float32Array(right));
   gl.uniform3fv(orbProgram.uUp, new Float32Array(up));
-  gl.uniform1f(orbProgram.uSize, orbState.size);
-  gl.uniform3fv(orbProgram.uColorOuter, new Float32Array([1.0, 1.0, 1.0]));
-  gl.uniform3fv(orbProgram.uColorInner, new Float32Array([0.85, 0.85, 0.9]));
 
   gl.bindBuffer(gl.ARRAY_BUFFER, orbBillboardVbo);
   gl.enableVertexAttribArray(orbProgram.aOffset);
   gl.vertexAttribPointer(orbProgram.aOffset, 2, gl.FLOAT, false, 8, 0);
 
-  gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
+  for (const orbState of orbStates) {
+    const center = currentOrbiterPosition(orbState);
+    gl.uniform3fv(orbProgram.uCenter, new Float32Array(center));
+    gl.uniformMatrix4fv(orbProgram.uView, false, view);
+    gl.uniformMatrix4fv(orbProgram.uProjection, false, projection);
+    gl.uniform1f(orbProgram.uSize, orbState.size);
+    gl.uniform3fv(orbProgram.uColorOuter, new Float32Array([1.0, 1.0, 1.0]));
+    gl.uniform3fv(orbProgram.uColorInner, new Float32Array([0.85, 0.85, 0.9]));
+
+    gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
+  }
 }
 
 function drawOrbiterTrail(gl, view, projection) {
-  if (!orbTrailSpriteProgram || !orbTrailVbo || !orbTrailIbo || !orbState.trailPositions.length) return;
-
-  // Rebuild trail quad geometry when dirty
-  if (orbState.trailDirty) {
-    const trail = orbState.trailPositions;
-    const count = trail.length;
-    const verts = new Float32Array(count * 4 * 7); // center xyz, offset xy, size, alpha
-    const indices = new Uint16Array(count * 6);
-    let vi = 0;
-    let ii = 0;
-    for (let i = 0; i < count; i++) {
-      const p = trail[i];
-      const t = i / (count - 1 || 1); // 0 = oldest (tail), 1 = newest (head)
-      // Sharper taper and brighter, fuller head
-      const alpha = Math.pow(t, 0.45) * 0.9;
-      const size = orbState.size * (0.14 + 0.95 * t); // thinner ribbon, distinct from orb
-      const offsets = [
-        [-1, -1],
-        [1, -1],
-        [1, 1],
-        [-1, 1],
-      ];
-      for (const o of offsets) {
-        verts[vi++] = p[0];
-        verts[vi++] = p[1];
-        verts[vi++] = p[2];
-        verts[vi++] = o[0];
-        verts[vi++] = o[1];
-        verts[vi++] = size;
-        verts[vi++] = alpha;
-      }
-      const base = i * 4;
-      indices[ii++] = base + 0;
-      indices[ii++] = base + 1;
-      indices[ii++] = base + 2;
-      indices[ii++] = base + 0;
-      indices[ii++] = base + 2;
-      indices[ii++] = base + 3;
-    }
-    orbTrailVertexCount = indices.length;
-    gl.bindBuffer(gl.ARRAY_BUFFER, orbTrailVbo);
-    gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, orbTrailIbo);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.DYNAMIC_DRAW);
-    orbState.trailDirty = false;
-  }
+  if (!orbTrailSpriteProgram || !orbTrailVbo || !orbTrailIbo) return;
+  if (!orbStates.length && !retiredTrails.length) return;
 
   gl.useProgram(orbTrailSpriteProgram.program);
   gl.uniformMatrix4fv(orbTrailSpriteProgram.uView, false, view);
@@ -1710,18 +2079,70 @@ function drawOrbiterTrail(gl, view, projection) {
   gl.uniform3fv(orbTrailSpriteProgram.uUp, new Float32Array(up));
 
   gl.bindBuffer(gl.ARRAY_BUFFER, orbTrailVbo);
-  const stride = 7 * 4;
-  gl.enableVertexAttribArray(orbTrailSpriteProgram.aCenter);
-  gl.vertexAttribPointer(orbTrailSpriteProgram.aCenter, 3, gl.FLOAT, false, stride, 0);
-  gl.enableVertexAttribArray(orbTrailSpriteProgram.aOffset);
-  gl.vertexAttribPointer(orbTrailSpriteProgram.aOffset, 2, gl.FLOAT, false, stride, 12);
-  gl.enableVertexAttribArray(orbTrailSpriteProgram.aSize);
-  gl.vertexAttribPointer(orbTrailSpriteProgram.aSize, 1, gl.FLOAT, false, stride, 20);
-  gl.enableVertexAttribArray(orbTrailSpriteProgram.aAlpha);
-  gl.vertexAttribPointer(orbTrailSpriteProgram.aAlpha, 1, gl.FLOAT, false, stride, 24);
-
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, orbTrailIbo);
-  gl.drawElements(gl.TRIANGLES, orbTrailVertexCount, gl.UNSIGNED_SHORT, 0);
+
+  const stride = 7 * 4;
+
+  const renderables = [...orbStates, ...retiredTrails];
+
+  for (const orbState of renderables) {
+    if (!orbState.trailPositions.length) continue;
+
+    // Rebuild trail quad geometry when dirty
+    if (orbState.trailDirty) {
+      const trail = orbState.trailPositions;
+      const count = trail.length;
+      const verts = new Float32Array(count * 4 * 7); // center xyz, offset xy, size, alpha
+      const indices = new Uint16Array(count * 6);
+      let vi = 0;
+      let ii = 0;
+      for (let i = 0; i < count; i++) {
+        const p = trail[i];
+        const t = i / (count - 1 || 1); // 0 = oldest (tail), 1 = newest (head)
+        // Sharper taper and brighter, fuller head
+        const alpha = Math.pow(t, 0.45) * 0.9 * (orbState.alphaScale ?? 1);
+        const size = orbState.size * (0.14 + 0.95 * t); // thinner ribbon, distinct from orb
+        const offsets = [
+          [-1, -1],
+          [1, -1],
+          [1, 1],
+          [-1, 1],
+        ];
+        for (const o of offsets) {
+          verts[vi++] = p[0];
+          verts[vi++] = p[1];
+          verts[vi++] = p[2];
+          verts[vi++] = o[0];
+          verts[vi++] = o[1];
+          verts[vi++] = size;
+          verts[vi++] = alpha;
+        }
+        const base = i * 4;
+        indices[ii++] = base + 0;
+        indices[ii++] = base + 1;
+        indices[ii++] = base + 2;
+        indices[ii++] = base + 0;
+        indices[ii++] = base + 2;
+        indices[ii++] = base + 3;
+      }
+      orbState.trailIndexCount = indices.length;
+      gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.DYNAMIC_DRAW);
+      orbState.trailDirty = false;
+    }
+
+    gl.enableVertexAttribArray(orbTrailSpriteProgram.aCenter);
+    gl.vertexAttribPointer(orbTrailSpriteProgram.aCenter, 3, gl.FLOAT, false, stride, 0);
+    gl.enableVertexAttribArray(orbTrailSpriteProgram.aOffset);
+    gl.vertexAttribPointer(orbTrailSpriteProgram.aOffset, 2, gl.FLOAT, false, stride, 12);
+    gl.enableVertexAttribArray(orbTrailSpriteProgram.aSize);
+    gl.vertexAttribPointer(orbTrailSpriteProgram.aSize, 1, gl.FLOAT, false, stride, 20);
+    gl.enableVertexAttribArray(orbTrailSpriteProgram.aAlpha);
+    gl.vertexAttribPointer(orbTrailSpriteProgram.aAlpha, 1, gl.FLOAT, false, stride, 24);
+
+    const count = orbState.trailIndexCount || orbTrailVertexCount;
+    gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, 0);
+  }
 }
 
 function createOrbProgram(gl) {
