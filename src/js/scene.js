@@ -45,9 +45,12 @@ let orbTrailVertexCount = 0;
 let orbStates = [];
 let orbCount = 3;
 let retiredTrails = [];
+let orbIdCounter = 1;
 
 function createOrbState() {
   return {
+    id: orbIdCounter++,
+    name: `Orb ${orbIdCounter - 1}`,
     angle: Math.random() * Math.PI * 2,
     angularSpeed: 0.6, // radians/sec
     radius: 1.6,
@@ -74,6 +77,9 @@ function createOrbState() {
     teleportPlanned: false,
     teleportDone: false,
     skipTrailInterpolation: false,
+    isChaser: false,
+    targetId: null,
+    color: null, // will be derived each frame
   };
 }
 
@@ -511,10 +517,12 @@ export function setOrbCount(count) {
       pickNewFlightSegment(state, true);
       orbStates.push(state);
     }
+    assignChasers();
   } else if (next < orbStates.length) {
     while (orbStates.length > next) {
       const removed = orbStates.pop();
       if (removed && removed.trailPositions?.length) {
+        const trailColor = getOrbTrailColor(removed);
         retiredTrails.push({
           trailPositions: removed.trailPositions.slice(),
           size: removed.size,
@@ -522,12 +530,33 @@ export function setOrbCount(count) {
           fade: 1.2, // seconds to fade out
           trailDirty: true,
           trailIndexCount: removed.trailIndexCount || 0,
+          color: trailColor,
         });
       }
     }
   }
 
   orbCount = next;
+}
+
+export function getOrbiters() {
+  return orbStates.map((o) => ({
+    id: o.id,
+    name: o.name,
+    isChaser: o.isChaser,
+  }));
+}
+
+export function setOrbChaser(id, isChaser) {
+  const orb = orbStates.find((o) => o.id === id);
+  if (!orb) return;
+  if (isChaser) {
+    orb.isChaser = true;
+    assignTargetFor(orb);
+  } else {
+    orb.isChaser = false;
+    orb.targetId = null;
+  }
 }
 
 export function renderScene(gl) {
@@ -1847,11 +1876,15 @@ function initOrbiters(gl) {
     pickNewFlightSegment(state, true);
     orbStates.push(state);
   }
+  assignChasers();
 }
 
 function updateOrbiters(dt) {
   for (const orb of orbStates) {
     updateSingleOrb(orb, dt);
+    if (orb.isChaser && orb.targetId) {
+      steerChaser(orb);
+    }
   }
   resolveOrbCollisions();
 }
@@ -1968,6 +2001,38 @@ function updateSingleOrb(orbState, dt) {
   orbState.trailDirty = true;
 }
 
+function assignChasers() {
+  if (orbStates.length < 2) return;
+  // Clear existing chase tags
+  orbStates.forEach((o) => {
+    o.isChaser = false;
+    o.targetId = null;
+  });
+
+  // 30% of orbs become chasers
+  const indices = orbStates.map((_, i) => i);
+  const chaserCount = Math.max(1, Math.floor(orbStates.length * 0.3));
+  for (let i = 0; i < chaserCount; i++) {
+    const idx = Math.floor(Math.random() * indices.length);
+    const orbIdx = indices.splice(idx, 1)[0];
+    const orb = orbStates[orbIdx];
+    orb.isChaser = true;
+    assignTargetFor(orb);
+  }
+}
+
+function assignTargetFor(orb) {
+  const targets = orbStates.filter((o) => o.id !== orb.id);
+  if (!targets.length) {
+    orb.targetId = null;
+    return;
+  }
+  const target = targets[Math.floor(Math.random() * targets.length)];
+  orb.targetId = target.id;
+  // Speed up chasers a bit
+  orb.targetAngularSpeed = Math.max(orb.targetAngularSpeed, 1.1);
+}
+
 function resolveOrbCollisions() {
   const minDist = 0.18; // approximate sprite diameter for bounce
   for (let i = 0; i < orbStates.length; i++) {
@@ -1993,6 +2058,40 @@ function resolveOrbCollisions() {
       }
     }
   }
+}
+
+function steerChaser(orb) {
+  const target = orbStates.find((o) => o.id === orb.targetId);
+  if (!target) return;
+  const p = currentOrbiterPosition(orb);
+  const t = currentOrbiterPosition(target);
+  // Desired plane normal is perpendicular to both positions so the orbit plane passes near both.
+  let desired = cross(p, t);
+  const len = length(desired);
+  if (len < 1e-4) return;
+  desired = desired.map((v) => v / len);
+  orb.targetPlaneNormal = desired;
+  // Bias speed up a bit while chasing
+  orb.targetAngularSpeed = Math.max(orb.targetAngularSpeed, 1.3);
+}
+
+function getOrbColors(orb) {
+  if (orb.isChaser) {
+    return {
+      outer: [1.0, 0.42, 0.42],
+      inner: [1.0, 0.78, 0.60],
+      trail: [1.0, 0.55, 0.55],
+    };
+  }
+  return {
+    outer: [1.0, 1.0, 1.0],
+    inner: [0.85, 0.85, 0.9],
+    trail: [1.0, 1.0, 1.0],
+  };
+}
+
+function getOrbTrailColor(orb) {
+  return getOrbColors(orb).trail;
 }
 
 function currentOrbiterPosition(orbState) {
@@ -2052,12 +2151,13 @@ function drawOrbiter(gl, view, projection) {
 
   for (const orbState of orbStates) {
     const center = currentOrbiterPosition(orbState);
+    const colors = getOrbColors(orbState);
     gl.uniform3fv(orbProgram.uCenter, new Float32Array(center));
     gl.uniformMatrix4fv(orbProgram.uView, false, view);
     gl.uniformMatrix4fv(orbProgram.uProjection, false, projection);
     gl.uniform1f(orbProgram.uSize, orbState.size);
-    gl.uniform3fv(orbProgram.uColorOuter, new Float32Array([1.0, 1.0, 1.0]));
-    gl.uniform3fv(orbProgram.uColorInner, new Float32Array([0.85, 0.85, 0.9]));
+    gl.uniform3fv(orbProgram.uColorOuter, new Float32Array(colors.outer));
+    gl.uniform3fv(orbProgram.uColorInner, new Float32Array(colors.inner));
 
     gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
   }
@@ -2070,7 +2170,6 @@ function drawOrbiterTrail(gl, view, projection) {
   gl.useProgram(orbTrailSpriteProgram.program);
   gl.uniformMatrix4fv(orbTrailSpriteProgram.uView, false, view);
   gl.uniformMatrix4fv(orbTrailSpriteProgram.uProjection, false, projection);
-  gl.uniform3fv(orbTrailSpriteProgram.uColor, new Float32Array([1.0, 1.0, 1.0]));
 
   const m = camera.view;
   const right = [m[0], m[4], m[8]];
@@ -2087,6 +2186,8 @@ function drawOrbiterTrail(gl, view, projection) {
 
   for (const orbState of renderables) {
     if (!orbState.trailPositions.length) continue;
+    const color = orbState.color || (orbState.id ? getOrbTrailColor(orbState) : [1, 1, 1]);
+    gl.uniform3fv(orbTrailSpriteProgram.uColor, new Float32Array(color));
 
     // Rebuild trail quad geometry when dirty
     if (orbState.trailDirty) {
