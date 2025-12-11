@@ -46,8 +46,10 @@ let orbStates = [];
 let orbCount = 3;
 let retiredTrails = [];
 let orbIdCounter = 1;
+let collisionBursts = [];
 
 function createOrbState() {
+  const baseColor = randomBrightColor();
   return {
     id: orbIdCounter++,
     name: `Orb ${orbIdCounter - 1}`,
@@ -77,9 +79,9 @@ function createOrbState() {
     teleportPlanned: false,
     teleportDone: false,
     skipTrailInterpolation: false,
-    isChaser: false,
-    targetId: null,
     color: null, // will be derived each frame
+    isSuper: false,
+    baseColor,
   };
 }
 
@@ -103,6 +105,30 @@ function randomUnitVec3() {
   const theta = randomRange(0, Math.PI * 2);
   const s = Math.sqrt(1 - u * u);
   return [s * Math.cos(theta), u, s * Math.sin(theta)];
+}
+
+function randomBrightColor() {
+  // Generate a vivid color with minimum brightness
+  const h = Math.random();
+  const s = 0.7 + Math.random() * 0.3;
+  const v = 0.8 + Math.random() * 0.2;
+  const toRgb = (h, s, v) => {
+    const i = Math.floor(h * 6);
+    const f = h * 6 - i;
+    const p = v * (1 - s);
+    const q = v * (1 - f * s);
+    const t = v * (1 - (1 - f) * s);
+    const mod = i % 6;
+    const rgb =
+      mod === 0 ? [v, t, p] :
+      mod === 1 ? [q, v, p] :
+      mod === 2 ? [p, v, t] :
+      mod === 3 ? [p, q, v] :
+      mod === 4 ? [t, p, v] :
+      [v, p, q];
+    return rgb;
+  };
+  return toRgb(h, s, v);
 }
 
 function lerpVec3(out, a, b, t) {
@@ -470,6 +496,7 @@ export function updateScene(gl, dt) {
   applyCameraKeyboard(dt);
   updateOrbiters(dt);
   decayRetiredTrails(dt);
+  updateCollisionBursts(dt);
 }
 
 export function getCameraState() {
@@ -517,7 +544,6 @@ export function setOrbCount(count) {
       pickNewFlightSegment(state, true);
       orbStates.push(state);
     }
-    assignChasers();
   } else if (next < orbStates.length) {
     while (orbStates.length > next) {
       const removed = orbStates.pop();
@@ -543,19 +569,16 @@ export function getOrbiters() {
   return orbStates.map((o) => ({
     id: o.id,
     name: o.name,
-    isChaser: o.isChaser,
+    isSuper: o.isSuper,
   }));
 }
 
-export function setOrbChaser(id, isChaser) {
+export function setOrbSuperSaiyan(id, isSuper) {
   const orb = orbStates.find((o) => o.id === id);
   if (!orb) return;
-  if (isChaser) {
-    orb.isChaser = true;
-    assignTargetFor(orb);
-  } else {
-    orb.isChaser = false;
-    orb.targetId = null;
+  orb.isSuper = !!isSuper;
+  if (orb.isSuper) {
+    orb.targetAngularSpeed = Math.max(orb.targetAngularSpeed, 1.6);
   }
 }
 
@@ -1652,9 +1675,9 @@ function drawBackgroundGradient(gl) {
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bgQuadIbo);
 
   // Sky gradient: pink upper half blending to warm yellow lower half
-  gl.uniform3fv(bgProgram.uTop, new Float32Array([0.94, 0.60, 0.88]));   // dominant pink
-  gl.uniform3fv(bgProgram.uMid, new Float32Array([0.95, 0.66, 0.84]));   // pink-heavy transition
-  gl.uniform3fv(bgProgram.uBottom, new Float32Array([0.96, 0.74, 0.70])); // pink-washed yellow at the base
+  gl.uniform3fv(bgProgram.uTop, new Float32Array([0.96, 0.62, 0.90]));   // deeper pink
+  gl.uniform3fv(bgProgram.uMid, new Float32Array([0.97, 0.70, 0.90]));   // rich pink transition
+  gl.uniform3fv(bgProgram.uBottom, new Float32Array([0.98, 0.80, 0.78])); // pink-heavy base
   setCameraBasisUniforms(gl, bgProgram);
 
   gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
@@ -1876,17 +1899,29 @@ function initOrbiters(gl) {
     pickNewFlightSegment(state, true);
     orbStates.push(state);
   }
-  assignChasers();
 }
 
 function updateOrbiters(dt) {
   for (const orb of orbStates) {
     updateSingleOrb(orb, dt);
-    if (orb.isChaser && orb.targetId) {
-      steerChaser(orb);
+    if (orb.isSuper) {
+      // additional speed bias
+      orb.targetAngularSpeed = Math.max(orb.targetAngularSpeed, 1.6);
     }
   }
+  applyMutualAttraction(dt);
   resolveOrbCollisions();
+}
+
+function spawnCollisionBurst(pos, isSuper) {
+  const life = 0.6;
+  collisionBursts.push({
+    pos,
+    life,
+    maxLife: life,
+    size: isSuper ? 0.24 : 0.18, // larger bursts
+    color: isSuper ? [1.0, 0.98, 0.9] : [1.0, 1.0, 1.0], // bright white
+  });
 }
 
 function decayRetiredTrails(dt) {
@@ -1899,6 +1934,17 @@ function decayRetiredTrails(dt) {
     } else {
       r.alphaScale = Math.max(0, r.fade / 1.2);
       r.trailDirty = true;
+    }
+  }
+}
+
+function updateCollisionBursts(dt) {
+  if (!collisionBursts.length) return;
+  for (let i = collisionBursts.length - 1; i >= 0; i--) {
+    const b = collisionBursts[i];
+    b.life -= dt;
+    if (b.life <= 0) {
+      collisionBursts.splice(i, 1);
     }
   }
 }
@@ -2001,38 +2047,6 @@ function updateSingleOrb(orbState, dt) {
   orbState.trailDirty = true;
 }
 
-function assignChasers() {
-  if (orbStates.length < 2) return;
-  // Clear existing chase tags
-  orbStates.forEach((o) => {
-    o.isChaser = false;
-    o.targetId = null;
-  });
-
-  // 30% of orbs become chasers
-  const indices = orbStates.map((_, i) => i);
-  const chaserCount = Math.max(1, Math.floor(orbStates.length * 0.3));
-  for (let i = 0; i < chaserCount; i++) {
-    const idx = Math.floor(Math.random() * indices.length);
-    const orbIdx = indices.splice(idx, 1)[0];
-    const orb = orbStates[orbIdx];
-    orb.isChaser = true;
-    assignTargetFor(orb);
-  }
-}
-
-function assignTargetFor(orb) {
-  const targets = orbStates.filter((o) => o.id !== orb.id);
-  if (!targets.length) {
-    orb.targetId = null;
-    return;
-  }
-  const target = targets[Math.floor(Math.random() * targets.length)];
-  orb.targetId = target.id;
-  // Speed up chasers a bit
-  orb.targetAngularSpeed = Math.max(orb.targetAngularSpeed, 1.1);
-}
-
 function resolveOrbCollisions() {
   const minDist = 0.18; // approximate sprite diameter for bounce
   for (let i = 0; i < orbStates.length; i++) {
@@ -2049,44 +2063,90 @@ function resolveOrbCollisions() {
         const nx = dx / dist;
         const ny = dy / dist;
         const nz = dz / dist;
-        orbStates[i].renderRadius += overlap * 0.05;
-        orbStates[j].renderRadius += overlap * 0.05;
+        const superA = orbStates[i].isSuper;
+        const superB = orbStates[j].isSuper;
+        const pushScaleA = superA && !superB ? 0.12 : 0.05;
+        const pushScaleB = superB && !superA ? 0.12 : 0.05;
+        orbStates[i].renderRadius += overlap * pushScaleA;
+        orbStates[j].renderRadius += overlap * pushScaleB;
         orbStates[i].direction *= -1;
         orbStates[j].direction *= -1;
-        orbStates[i].angle += 0.2;
-        orbStates[j].angle -= 0.2;
+        const impulse = superA !== superB ? 0.65 : 0.2;
+        orbStates[i].angle += impulse * (superB ? -1 : 1);
+        orbStates[j].angle -= impulse * (superA ? -1 : 1);
+
+        const hitPos = [
+          (a[0] + b[0]) * 0.5,
+          (a[1] + b[1]) * 0.5,
+          (a[2] + b[2]) * 0.5,
+        ];
+        spawnCollisionBurst(hitPos, superA || superB);
       }
     }
   }
 }
 
-function steerChaser(orb) {
-  const target = orbStates.find((o) => o.id === orb.targetId);
-  if (!target) return;
-  const p = currentOrbiterPosition(orb);
-  const t = currentOrbiterPosition(target);
-  // Desired plane normal is perpendicular to both positions so the orbit plane passes near both.
-  let desired = cross(p, t);
-  const len = length(desired);
-  if (len < 1e-4) return;
-  desired = desired.map((v) => v / len);
-  orb.targetPlaneNormal = desired;
-  // Bias speed up a bit while chasing
-  orb.targetAngularSpeed = Math.max(orb.targetAngularSpeed, 1.3);
+function applyMutualAttraction(dt) {
+  const attractDist = 0.55;
+  const attractStrength = 0.35;
+  for (let i = 0; i < orbStates.length; i++) {
+    for (let j = i + 1; j < orbStates.length; j++) {
+      const a = currentOrbiterPosition(orbStates[i]);
+      const b = currentOrbiterPosition(orbStates[j]);
+      const dx = b[0] - a[0];
+      const dy = b[1] - a[1];
+      const dz = b[2] - a[2];
+      const dist = Math.hypot(dx, dy, dz);
+      if (dist > 0 && dist < attractDist) {
+        const pull = (attractDist - dist) * attractStrength * dt;
+        // Nudge their target radii/heights slightly toward each other
+        const dir = [dx / dist, dy / dist, dz / dist];
+        const orbA = orbStates[i];
+        const orbB = orbStates[j];
+
+        orbA.targetRadius = clampOrbit(orbA.targetRadius - pull * 0.5, ORBIT_MIN_RADIUS, ORBIT_MAX_RADIUS);
+        orbB.targetRadius = clampOrbit(orbB.targetRadius - pull * 0.5, ORBIT_MIN_RADIUS, ORBIT_MAX_RADIUS);
+
+        orbA.targetHeight += dir[1] * pull * 0.4;
+        orbB.targetHeight -= dir[1] * pull * 0.4;
+
+        // Slightly align plane normals toward midpoint to encourage meeting
+        const mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5];
+        const desiredA = normalizeVec3(cross(mid, a));
+        const desiredB = normalizeVec3(cross(mid, b));
+        const blend = 0.08;
+        if (desiredA && desiredA.length) {
+          orbA.targetPlaneNormal = normalizeVec3([
+            orbA.targetPlaneNormal[0] * (1 - blend) + desiredA[0] * blend,
+            orbA.targetPlaneNormal[1] * (1 - blend) + desiredA[1] * blend,
+            orbA.targetPlaneNormal[2] * (1 - blend) + desiredA[2] * blend,
+          ]);
+        }
+        if (desiredB && desiredB.length) {
+          orbB.targetPlaneNormal = normalizeVec3([
+            orbB.targetPlaneNormal[0] * (1 - blend) + desiredB[0] * blend,
+            orbB.targetPlaneNormal[1] * (1 - blend) + desiredB[1] * blend,
+            orbB.targetPlaneNormal[2] * (1 - blend) + desiredB[2] * blend,
+          ]);
+        }
+      }
+    }
+  }
 }
 
 function getOrbColors(orb) {
-  if (orb.isChaser) {
+  if (orb.isSuper) {
     return {
-      outer: [1.0, 0.42, 0.42],
-      inner: [1.0, 0.78, 0.60],
-      trail: [1.0, 0.55, 0.55],
+      outer: [1.0, 0.88, 0.4], // golden aura
+      inner: [0.65, 0.88, 1.0], // light blue core
+      trail: [1.0, 0.88, 0.45], // golden trail
     };
   }
+  const c = orb.baseColor || [1, 1, 1];
   return {
-    outer: [1.0, 1.0, 1.0],
-    inner: [0.85, 0.85, 0.9],
-    trail: [1.0, 1.0, 1.0],
+    outer: c,
+    inner: c,
+    trail: c,
   };
 }
 
@@ -2160,6 +2220,29 @@ function drawOrbiter(gl, view, projection) {
     gl.uniform3fv(orbProgram.uColorInner, new Float32Array(colors.inner));
 
     gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
+  }
+
+  // Collision bursts
+  if (collisionBursts.length) {
+    for (const burst of collisionBursts) {
+      const t = Math.max(0, burst.life / burst.maxLife);
+      const size = burst.size * (0.6 + 0.8 * t);
+      const alpha = Math.pow(t, 1.5);
+      gl.uniform3fv(orbProgram.uCenter, new Float32Array(burst.pos));
+      gl.uniformMatrix4fv(orbProgram.uView, false, view);
+      gl.uniformMatrix4fv(orbProgram.uProjection, false, projection);
+      gl.uniform1f(orbProgram.uSize, size);
+      gl.uniform3fv(orbProgram.uColorOuter, new Float32Array(burst.color));
+      gl.uniform3fv(orbProgram.uColorInner, new Float32Array([
+        burst.color[0] * 0.8,
+        burst.color[1] * 0.8,
+        burst.color[2] * 0.8,
+      ]));
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
+      gl.disable(gl.BLEND);
+    }
   }
 }
 

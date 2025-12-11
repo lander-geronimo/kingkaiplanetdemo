@@ -9,7 +9,7 @@ import {
   getOrbCount,
   setOrbCount,
   getOrbiters,
-  setOrbChaser,
+  setOrbSuperSaiyan,
 } from "./scene.js";
 
 let gl;
@@ -50,12 +50,12 @@ function setupUI() {
   const zoom = document.getElementById("zoom");
   const spriteCount = document.getElementById("spriteCount");
   const orbSelect = document.getElementById("orbSelect");
-  const chaserToggle = document.getElementById("chaserToggle");
+  const superToggle = document.getElementById("superToggle");
   const thetaVal = document.getElementById("thetaVal");
   const phiVal = document.getElementById("phiVal");
   const zoomVal = document.getElementById("zoomVal");
 
-  if (!theta || !phi || !zoom || !spriteCount || !orbSelect || !chaserToggle) return;
+  if (!theta || !phi || !zoom || !spriteCount || !orbSelect || !superToggle) return;
 
   const applyCameraFromInputs = () => {
     setCameraState({
@@ -78,15 +78,15 @@ function setupUI() {
   setOrbCount(parseInt(spriteCount.value, 10) || getOrbCount());
 
   orbSelect.addEventListener("change", () => {
-    syncOrbSelection(orbSelect, chaserToggle);
+    syncOrbSelection(orbSelect, superToggle);
   });
-  chaserToggle.addEventListener("change", () => {
+  superToggle.addEventListener("change", () => {
     const id = parseInt(orbSelect.value, 10);
     if (!Number.isFinite(id)) return;
-    setOrbChaser(id, chaserToggle.checked);
+    setOrbSuperSaiyan(id, superToggle.checked);
   });
 
-  uiRefs = { theta, phi, zoom, spriteCount, thetaVal, phiVal, zoomVal, orbSelect, chaserToggle };
+  uiRefs = { theta, phi, zoom, spriteCount, thetaVal, phiVal, zoomVal, orbSelect, superToggle };
   rebuildOrbSelect(orbSelect);
   syncUI();
 }
@@ -102,7 +102,7 @@ function syncUI() {
   if (uiRefs.phiVal) uiRefs.phiVal.textContent = `${deg(cam.phi)}°`;
   if (uiRefs.zoomVal) uiRefs.zoomVal.textContent = cam.radius.toFixed(2);
   rebuildOrbSelect(uiRefs.orbSelect);
-  syncOrbSelection(uiRefs.orbSelect, uiRefs.chaserToggle);
+  syncOrbSelection(uiRefs.orbSelect, uiRefs.superToggle);
 }
 
 function rebuildOrbSelect(selectEl) {
@@ -124,10 +124,10 @@ function rebuildOrbSelect(selectEl) {
   if (first !== undefined) selectEl.value = first;
 }
 
-function syncOrbSelection(selectEl, toggleEl) {
-  if (!selectEl || !toggleEl) return;
+function syncOrbSelection(selectEl, superToggle) {
+  if (!selectEl || !superToggle) return;
   const id = parseInt(selectEl.value, 10);
   const orb = getOrbiters().find((o) => o.id === id);
   if (!orb) return;
-  toggleEl.checked = !!orb.isChaser;
+  superToggle.checked = !!orb.isSuper;
 }
