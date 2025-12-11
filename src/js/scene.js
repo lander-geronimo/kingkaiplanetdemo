@@ -79,7 +79,7 @@ function createOrbState() {
     teleportPlanned: false,
     teleportDone: false,
     skipTrailInterpolation: false,
-    color: null, // will be derived each frame
+    color: baseColor, // store chosen color
     isSuper: false,
     baseColor,
   };
@@ -108,10 +108,10 @@ function randomUnitVec3() {
 }
 
 function randomBrightColor() {
-  // Generate a vivid color with minimum brightness
+  // Pastel-ish palette: moderate saturation, high value
   const h = Math.random();
-  const s = 0.7 + Math.random() * 0.3;
-  const v = 0.8 + Math.random() * 0.2;
+  const s = 0.35 + Math.random() * 0.2; // 0.35–0.55
+  const v = 0.88 + Math.random() * 0.12; // 0.88–1.0
   const toRgb = (h, s, v) => {
     const i = Math.floor(h * 6);
     const f = h * 6 - i;
@@ -1919,8 +1919,8 @@ function spawnCollisionBurst(pos, isSuper) {
     pos,
     life,
     maxLife: life,
-    size: isSuper ? 0.24 : 0.18, // larger bursts
-    color: isSuper ? [1.0, 0.98, 0.9] : [1.0, 1.0, 1.0], // bright white
+    size: isSuper ? 0.28 : 0.22, // larger bursts
+    color: [1.0, 1.0, 1.0], // pure bright white
   });
 }
 
@@ -2142,7 +2142,7 @@ function getOrbColors(orb) {
       trail: [1.0, 0.88, 0.45], // golden trail
     };
   }
-  const c = orb.baseColor || [1, 1, 1];
+  const c = orb.color || orb.baseColor || [1, 1, 1];
   return {
     outer: c,
     inner: c,
@@ -2151,7 +2151,7 @@ function getOrbColors(orb) {
 }
 
 function getOrbTrailColor(orb) {
-  return getOrbColors(orb).trail;
+  return getOrbColors(orb).trail || [1, 1, 1];
 }
 
 function currentOrbiterPosition(orbState) {
@@ -2198,6 +2198,9 @@ function drawOrbiter(gl, view, projection) {
   if (!orbProgram || !orbBillboardVbo || !orbStates.length) return;
   gl.useProgram(orbProgram.program);
 
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
   // Camera basis
   const m = camera.view;
   const right = [m[0], m[4], m[8]];
@@ -2238,12 +2241,10 @@ function drawOrbiter(gl, view, projection) {
         burst.color[1] * 0.8,
         burst.color[2] * 0.8,
       ]));
-      gl.enable(gl.BLEND);
-      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
-      gl.disable(gl.BLEND);
     }
   }
+  gl.disable(gl.BLEND);
 }
 
 function drawOrbiterTrail(gl, view, projection) {
@@ -2251,6 +2252,9 @@ function drawOrbiterTrail(gl, view, projection) {
   if (!orbStates.length && !retiredTrails.length) return;
 
   gl.useProgram(orbTrailSpriteProgram.program);
+  const wasBlend = gl.isEnabled(gl.BLEND);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   gl.uniformMatrix4fv(orbTrailSpriteProgram.uView, false, view);
   gl.uniformMatrix4fv(orbTrailSpriteProgram.uProjection, false, projection);
 
@@ -2269,7 +2273,7 @@ function drawOrbiterTrail(gl, view, projection) {
 
   for (const orbState of renderables) {
     if (!orbState.trailPositions.length) continue;
-    const color = orbState.color || (orbState.id ? getOrbTrailColor(orbState) : [1, 1, 1]);
+    const color = getOrbTrailColor(orbState);
     gl.uniform3fv(orbTrailSpriteProgram.uColor, new Float32Array(color));
 
     // Rebuild trail quad geometry when dirty
@@ -2327,6 +2331,7 @@ function drawOrbiterTrail(gl, view, projection) {
     const count = orbState.trailIndexCount || orbTrailVertexCount;
     gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, 0);
   }
+  if (!wasBlend) gl.disable(gl.BLEND);
 }
 
 function createOrbProgram(gl) {
@@ -2349,7 +2354,8 @@ function createOrbProgram(gl) {
     uRight: gl.getUniformLocation(program, "uRight"),
     uUp: gl.getUniformLocation(program, "uUp"),
     uSize: gl.getUniformLocation(program, "uSize"),
-    uColor: gl.getUniformLocation(program, "uColor"),
+    uColorOuter: gl.getUniformLocation(program, "uColorOuter"),
+    uColorInner: gl.getUniformLocation(program, "uColorInner"),
   };
 }
 
